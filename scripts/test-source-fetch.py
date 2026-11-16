@@ -12,7 +12,7 @@ SCRIPT = Path(__file__).resolve().with_name('fetch-media-sources.sh')
 
 class SourceFetchTests(unittest.TestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory(prefix='m4b-source-fetch-')
+        self.directory = tempfile.TemporaryDirectory(prefix='m4b-source-fetch-', dir=os.environ.get('TMPDIR','/root/.hermes/cache/scratch'))
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.good = b'unit-test upstream archive bytes'

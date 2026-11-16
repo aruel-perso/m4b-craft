@@ -1,48 +1,146 @@
-# m4b-Craft 0.2.0-alpha.1
+# m4b-Craft 0.3.0-alpha.1 release contract
 
-Release foundation: optional native GitHub Releases updater and a per-user Windows x86_64 MSI (Windows Installer product version **0.2.0**). Existing editing, import, playback, project recovery, CLI/MCP and export features remain.
+Approved target: Windows x86_64 MSI (MSI product version **0.3.0**) and native macOS
+AppleSilicon ARM64 DMG. This is release tooling, not evidence of publication or of a
+successful hosted build. Native Mac validation is pending the first actual CI run.
+See [VALIDATION.md](VALIDATION.md) for historical Linux/Wine evidence and current limits.
 
-On Windows x86_64, in Settings, enable update actions for the current session, choose Stable or Include prereleases, then Check GitHub Releases. Nothing contacts GitHub before opt-in and an explicit check. Check and download run on worker threads; media/project actions are locked until completion. Playback must be stopped. There is no periodic polling or telemetry. Stable excludes prereleases; Include prereleases considers both stable and prerelease versions. The highest newer semantic version among the latest 100 non-draft releases is considered. A failed signature on that release is an error, not a fallback to an older release.
+The Rust workspace owner bumps the root Cargo version to `0.3.0-alpha.1` separately.
+All current release scripts and CI discover `[workspace.package].version` from root
+Cargo.toml through `scripts/release_common.py`; do not package this branch's older
+Rust snapshot as 0.3. Merge the Rust version/updater work before tagging. The updater
+interface is `windows-x86_64` / `.msi` and `macos-aarch64` / `.dmg`; the GUI executable
+inside the Mac bundle is `Contents/MacOS/m4b-Craft`. The document type is `.m4bproj`.
+Declaring the type in Info.plist does not prove Finder open-event handling works.
 
-The updater trusts only the Ed25519 public key compiled from `packaging/update-public-key.hex`. Release assets must include `update-windows-x86_64.json`. Its envelope has exactly `payload` (a JSON string) and `signature` (hex Ed25519 signature of the exact UTF-8 payload bytes). The signed payload binds `version`, `platform`, `filename`, `sha256`, `size`, and `url`. Unknown fields, invalid versions/platforms, downgrades, mismatched release versions, oversized assets and untrusted URLs are rejected. Install is enabled only after signature and downloaded size/hash verification. Save the project first; installation requires a second explicit confirmation. Signature, size and hash are checked again immediately before launching system `msiexec /i`, with its normal UI and without quiet flags. The editor closes only after Windows Installer has been successfully launched, releasing its executable for replacement. Reopen it after completing or cancelling installation. The verified temporary MSI is retained across this handoff so it is not removed while Windows Installer uses it; it can be removed later through normal temporary-file cleanup. No automatic restart or project discard is performed.
+## Build and artifacts
 
-**The update signature is not Authenticode.** It authenticates the release manifest and installer bytes to this application. No Windows publisher certificate is available; the MSI and executable do not have a verified Windows publisher identity. Windows may display an unknown publisher warning. HTTPS, GitHub accounts and asset names alone do not authorize an update.
+Use Rust 1.100.0, locked Cargo dependencies, Python 3.11+, Bash, curl and native build
+tools. CI uses Ubuntu 24.04 with MinGW-w64/wixl/msitools for Windows and `macos-15`
+for Mac. GitHub lists that standard runner as ARM64; CI additionally requires
+`uname -m = arm64` and never cross-builds the Mac media tools. Runner reference:
+[GitHub hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+Xcode command-line clang/make, hdiutil, codesign, lipo and otool come from the Mac
+runner; no Homebrew package installation is performed. Mac deployment target is
+11.0; operation on that minimum OS has not been tested. Dependency/toolchain minimum
+OS requirements still need testing on actual older machines.
 
-Network policy: rustls HTTPS only; 10-second connection and 180-second total request timeout, at most five redirects, 1 MiB release listing, 16 KiB manifest, 512 MiB installer limit. Installer and manifest URLs must use the exact `https://github.com/aruel-perso/m4b-craft/releases/download/v<VERSION>/` location; redirect hosts are GitHub release origins (`github.com`, `release-assets.githubusercontent.com`, `objects.githubusercontent.com`). Downloads stream into exclusive temporary files. Files are removed on normal failure/completion; abrupt termination can leave a temporary installer. A local process with access to the user's files is outside this updater's threat model.
-
-## Build and package
-
-Use Rust **1.100.0**, Cargo.lock, one Cargo job, Python 3.11+, OpenSSL 3, MinGW-w64 x86_64 GNU tools and wixl/msitools. Linux GUI development dependencies are also needed for native tests. CI uses Ubuntu 24.04 and builds the Windows GNU target; no MSVC runtime installation is needed. System tools come from the runner distribution; the workflow is a rebuild recipe, not a claim of bit-for-bit reproducibility across distribution package updates. Rust dependencies and upstream media source are locked/pinned. Media tool configuration is in `scripts/build-ffmpeg-windows.sh` and `vendor/windows-media/config*`.
+Set `TMPDIR` to a writable scratch directory (locally use
+`/root/.hermes/cache/scratch`, not `/tmp`). Do not reuse another agent's Cargo target.
+The scripts do not install system packages; the disposable Linux CI job installs
+its own prerequisites. Example after merging the Rust changes:
 
 ```sh
-export CARGO_BUILD_JOBS=1
 export TMPDIR=/root/.hermes/cache/scratch
-cargo fetch --locked
-cargo fmt --all -- --check
+export CARGO_BUILD_JOBS=1
+mkdir -p "$TMPDIR"
+VERSION=$(python3 scripts/release_common.py)
+bash scripts/fetch-media-sources.sh "$TMPDIR"
+# Linux with MinGW/wixl prerequisites:
+bash scripts/build-ffmpeg-windows.sh "$TMPDIR/ffmpeg-8.0.1.tar.xz" "$TMPDIR/zlib-1.3.1.tar.gz"
+python3 scripts/package-release.py
+python3 scripts/test-release.py --scratch "$TMPDIR" --msi "dist/release-$VERSION/m4b-Craft-$VERSION-windows-x86_64.msi"
+# On native ARM64 macOS instead:
+bash scripts/build-ffmpeg-macos.sh "$TMPDIR/ffmpeg-8.0.1.tar.xz" "$TMPDIR/zlib-1.3.1.tar.gz"
+export PATH="$PWD/vendor/macos-media:$PATH"
 cargo test --workspace --locked
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo build --workspace --locked
-python3 scripts/package-release.py --wixl /path/to/wixl
-python3 scripts/test-release.py --scratch "$TMPDIR" --msi dist/release-0.2.0-alpha.1/m4b-Craft-0.2.0-alpha.1-windows-x86_64.msi
+python3 scripts/package-macos.py
+python3 scripts/test-macos-release.py --scratch "$TMPDIR" --dmg "dist/release-$VERSION/m4b-Craft-$VERSION-macos-aarch64.dmg"
 ```
 
-The packager performs its own locked Windows GNU **release** build and stops on failure. It does not package the previous debug alpha. It emits the MSI, portable ZIP, FFmpeg/zlib source sidecar, SHA-256 files, generated full WiX source and retained payload in `dist/release-0.2.0-alpha.1/`. `packaging/windows/m4b-Craft.wxs` documents the base layout; the generator adds every application/source/license file. The MSI bundles app, CLI, ffmpeg, ffprobe, application source with Cargo.lock and build recipes, media build configurations and dependency license notices. Publish the media source ZIP alongside the MSI/portable ZIP. The exact FFmpeg 8.0.1 and zlib 1.3.1 archives are pinned by SHA-256 in the workflow. No media download occurs on user machines.
+`scripts/package-windows.py` forwards to the current Windows packager; it no longer
+packages the legacy debug alpha. Both packagers perform fresh locked release builds and stop on failure. Artifacts
+under `dist/release-VERSION/` use `m4b-Craft-VERSION-PLATFORM` names:
 
-For the already extracted local tools, set `LD_LIBRARY_PATH=/root/.hermes/cache/scratch/m4b-msi-tools/usr/lib/x86_64-linux-gnu` and use `/root/.hermes/cache/scratch/m4b-msi-tools/usr/bin/wixl`. The MSI installs under the current user's LocalAppData/Programs/m4b-Craft, registers in Windows installed applications and creates a Start menu shortcut. The stable UpgradeCode is `790fce8b-e564-43b1-9701-d427fdd80c6c`; never change it. MajorUpgrade removes older managed program files and blocks newer-product downgrades. User projects, imported assets and recovery are outside the managed installation and are never removed by this MSI. Do not save personal files into the program/source directory. New release versions must update the packager, WiX template and tag gate. MSI compares three numeric fields only: allocate a strictly increasing MSI version for each installable future release (including prereleases); do not reuse 0.2.0 for another prerelease product.
+| Platform | Public binary assets | Corresponding media sources |
+| --- | --- | --- |
+| windows-x86_64 | `.msi`, `.zip` | `-media-sources.zip` |
+| macos-aarch64 | `.dmg` | `-media-sources.zip` |
 
-## Sign and publish (reviewer only)
+Every listed file has its own `.sha256` sidecar. Windows also retains generated WiX
+and a review payload locally, excluded from public staging. Both bundles include
+application sources/Cargo.lock, build recipes, locked dependency license notices,
+FFmpeg configuration (`config.h`, `config_components.h`, `config.mak`), zlib generated
+build configuration, LGPL/zlib licenses and the GPL application license. Publish
+both source ZIPs alongside the installers. Source copying rejects symlinks and
+`.pem`/`.key` files. Private material must never be stored anywhere in source trees.
 
-The private Ed25519 PEM stays outside the repository. Never copy it into a payload, artifact, source archive, log or git. The signing tool checks that its derived public key matches the pinned repository key and verifies its own signature before writing the envelope.
+FFmpeg 8.0.1 and zlib 1.3.1 come only from official HTTPS release sources, with pinned
+SHA-256 checks before extraction/build. Fetch has a 64 MiB per-download cap, bounded connection/total time,
+retries and HTTPS-only redirects; HTTP-success challenge pages fail the checksum.
+Both platforms share codec options in `scripts/ffmpeg-options.sh`: built-in AAC
+encoding; common audio decoders/containers, cover image support, resampling/scaling;
+no network, external codec libraries, shared FFmpeg or ffplay. zlib is linked
+statically. Each platform's tool cache key contains platform and script digests;
+cache hits still validate the exact expected file records and both pinned archives.
+Cargo uses a separate normal platform cache. This is a rebuild recipe, not a claim
+of bit-for-bit reproducibility across runner/compiler updates.
+
+Mac `Contents/MacOS` contains `m4b-Craft`, `m4b-cli`, `ffmpeg`, `ffprobe`. All four must
+be Mach-O **arm64 only**; `otool -L` allows only `/usr/lib/` and `/System/Library/`
+loads, rejecting Homebrew, local, relative and `@rpath` dylibs. Thus no private dylib
+closure or Homebrew runtime is required. The DMG contains the `.app`, instructions
+and an `/Applications` symlink. Inner binaries and bundle receive ad-hoc signatures;
+codesign verification failures stop packaging. **No Developer ID, notarization,
+Gatekeeper acceptance or interactive GUI test is claimed.**
+
+The Windows MSI keeps UpgradeCode `790fce8b-e564-43b1-9701-d427fdd80c6c`, per-user
+LocalAppData/Programs installation, Start menu shortcut, uninstall registration,
+major-upgrade cleanup and downgrade blocking. User projects belong outside managed
+installation paths. MSI compares only three numeric version fields: future
+installable prereleases must receive a strictly increasing MSI numeric version;
+do not reuse 0.3.0 for another prerelease without an explicit versioning decision.
+The static WiX file is a layout reference; the generator derives the actual version.
+
+## Update signing and CI publication
+
+The pinned `packaging/update-public-key.hex` is unchanged. Only the external matching
+Ed25519 PEM can produce accepted updates. Envelope schema is exactly `payload`
+(JSON **string**) and `signature` (64-byte signature in hex). Signature input is the
+exact UTF-8 bytes of that string, not reserialized JSON. Its object has exactly
+`version`, `platform`, `filename`, `sha256`, `size`, `url`. URLs are bound to
+`https://github.com/aruel-perso/m4b-craft/releases/download/vVERSION/FILENAME`.
+Installer size must be 1–512 MiB. Canonical semver without build metadata is required;
+platform/extension/filename mismatch is rejected. Existing Windows `--msi` calls
+remain supported; `--installer` supports both platforms. Do not add payload fields
+without coordinating the Rust parser.
 
 ```sh
-python3 scripts/sign-update.py \
-  --key /external/private/update-signing.pem \
-  --version 0.2.0-alpha.1 \
-  --msi dist/release-0.2.0-alpha.1/m4b-Craft-0.2.0-alpha.1-windows-x86_64.msi \
-  --out dist/release-0.2.0-alpha.1/update-windows-x86_64.json \
-  --scratch /root/.hermes/cache/scratch
+VERSION=$(python3 scripts/release_common.py)
+python3 scripts/sign-update.py --key /external/update-signing.pem \
+  --version "$VERSION" --platform macos-aarch64 \
+  --installer "dist/release-$VERSION/m4b-Craft-$VERSION-macos-aarch64.dmg" \
+  --out "dist/release-$VERSION/update-macos-aarch64.json" --scratch "$TMPDIR"
+# Windows: --platform windows-x86_64, --installer ...windows-x86_64.msi,
+# --out .../update-windows-x86_64.json (or the legacy --msi alias).
 ```
 
-The tag workflow requires the protected `release` environment and `UPDATE_SIGNING_PEM` secret. Missing/incorrect secrets stop before publishing; there is no unsigned-update fallback. Build/PR jobs have read-only repository permissions and no signing secret. Only the tag release job has contents write permission. Current tag gate is `v0.2.0-alpha.1`, published as a prerelease. Configure the environment and protect release tags before enabling publishing. No repository upload, tag, commit, release or credential configuration is performed by the local scripts. The public repository may still be empty until the reviewer uploads it.
+The workflow runs independent Windows and native Mac jobs with read-only repository
+permissions. Mac runs native workspace tests and Clippy with bundled media on PATH,
+then mounts the DMG read-only, inspects bundle/plist/source/licenses, copies the app
+to a writable simulated Applications directory and ejects the image. With a
+system-only PATH, the **installed CLI** creates a PCM project, exports AAC/M4B,
+probes/fully decodes it, imports M4B and exports again. GUI launch/interaction,
+Finder document opening and actual `/Applications` replacement remain manual tests.
+Windows checks MSI tables/extraction, portable ZIP contents/CRC and source digests.
+Linux/Wine history is not native Windows or Mac proof.
 
-The empty remote cannot yet supply a live end-to-end update. Windows installation, upgrade, uninstall and interactive installer behavior must be smoke-tested on real Windows; Linux MSI table/extraction checks are not a substitute. Key rotation, delta updates, Linux installers and Authenticode signing are not included.
+The release job needs **both jobs successful**, a `vVERSION` tag matching Cargo,
+and the `release` environment. Restrict that environment to release tags and protect
+tags/reviewer access. `UPDATE_SIGNING_PEM` is read only in that tag job; no build/PR
+job receives it. Only release has `contents: write`. Downloaded artifacts are merged
+flat, then an exact file allowlist and every SHA-256 sidecar are checked before
+signing. Both `update-windows-x86_64.json` and `update-macos-aarch64.json` must be
+signed successfully before `gh release create`; prerelease tags use `--prerelease`.
+The temporary PEM is permission-restricted and removed with an EXIT trap. Local
+scripts never push, tag, publish, call release APIs or configure credentials.
+
+The 0.3 updater contract includes an automatic startup version check and manual
+checking, prerelease channel selection, pinned signature/download verification and
+**explicit consent before installation**. Integrate and test that Rust work before
+release. Save projects and stop playback/media work before handoff. Windows uses
+its visible MSI wizard; Mac uses the DMG/app-copy flow. Automatic checking is not
+consent to replace the application. Update signatures do not provide Authenticode
+or Apple publisher identity: expect unknown-publisher/SmartScreen and Gatekeeper
+warnings. Do not claim a live updater, native installation/upgrade or public release
+has been validated until the corresponding real execution is recorded.

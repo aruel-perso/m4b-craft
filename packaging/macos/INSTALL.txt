@@ -1,0 +1,11 @@
+m4b-Craft — AppleSilicon ARM64 only
+Drag m4b-Craft.app to Applications, then eject this disk image.
+The bundle contains the GUI, m4b-cli, ffmpeg and ffprobe in Contents/MacOS.
+No Homebrew runtime installation is required.
+This alpha has ad-hoc code signatures only: no Developer ID or notarization.
+Gatekeeper can block downloaded builds. Only open a build whose origin you trust;
+use macOS Privacy & Security / Open Anyway if appropriate for your policy.
+Keep projects/assets outside the application bundle. Copy the entire project
+folder (including assets) when transporting a project. Export M4B for players.
+Corresponding media source is in the accompanying -media-sources.zip;
+application source, build configuration and licenses are in Contents/Resources.

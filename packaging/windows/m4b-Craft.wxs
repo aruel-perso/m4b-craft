@@ -1,7 +1,7 @@
 <?xml version='1.0' encoding='utf-8'?>
 <!-- Base layout; release packager generates a component for every payload file. -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
-  <Product Id="5d4769be-a691-5d64-85d6-842b5d2519e4" Name="m4b-Craft" Language="1033" Version="0.2.0" Manufacturer="m4b-Craft contributors" UpgradeCode="790fce8b-e564-43b1-9701-d427fdd80c6c">
+  <Product Id="5d4769be-a691-5d64-85d6-842b5d2519e4" Name="m4b-Craft" Language="1033" Version="0.3.0" Manufacturer="m4b-Craft contributors" UpgradeCode="790fce8b-e564-43b1-9701-d427fdd80c6c">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perUser" Description="m4b-Craft audiobook editor" />
     <Media Id="1" Cabinet="application.cab" EmbedCab="yes" />
     <MajorUpgrade DowngradeErrorMessage="A newer m4b-Craft is already installed." />

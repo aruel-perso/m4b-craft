@@ -6,15 +6,15 @@ fetch_verified() {
   local destination="$1" digest="$2" url temporary
   shift 2
   mkdir -p "$(dirname "$destination")"
-  if [ -f "$destination" ] && printf '%s  %s\n' "$digest" "$destination" | sha256sum --status -c -; then
+  if [ -f "$destination" ] && printf '%s  %s\n' "$digest" "$destination" | shasum -a 256 -c - >/dev/null; then
     return 0
   fi
   for url in "$@"; do
     temporary="$(mktemp "$destination.partial.XXXXXX")"
     if curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
-      --connect-timeout 15 --max-time 120 --retry 2 --retry-delay 2 \
+      --connect-timeout 15 --max-time 120 --max-filesize 67108864 --retry 2 --retry-delay 2 \
       --output "$temporary" "$url" && \
-      printf '%s  %s\n' "$digest" "$temporary" | sha256sum --status -c -; then
+      printf '%s  %s\n' "$digest" "$temporary" | shasum -a 256 -c - >/dev/null; then
       mv -f "$temporary" "$destination"
       printf 'Verified source: %s\n' "$destination"
       return 0

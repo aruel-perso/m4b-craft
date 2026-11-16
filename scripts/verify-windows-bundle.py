@@ -15,6 +15,7 @@ import tempfile
 import wave
 import zipfile
 import zlib
+from release_common import VERSION
 
 
 def main():
@@ -31,7 +32,9 @@ def main():
         with zipfile.ZipFile(args.archive) as archive:
             assert archive.testzip() is None
             archive.extractall(temp / 'extracted')
-        package = next((temp / 'extracted').iterdir())
+        package = temp/'extracted'
+        if not (package/'m4b-cli.exe').is_file():
+            package = next(package.iterdir())
         cwd = temp / 'unrelated directory été'
         cwd.mkdir()
         # Poison CWD: runtime must locate its packaged tools by executable directory.
@@ -49,7 +52,7 @@ def main():
                 assert result.returncode != 0
             return result
         cli = package / 'm4b-cli.exe'
-        assert '0.1.1' in run(cli, '--version').stdout
+        assert VERSION in run(cli, '--version').stdout
         assert 'aac' in run(cli, 'encoders').stdout.splitlines()
         tracks = []
         for number, rate, frequency in [(2, 44100, 440), (10, 32000, 880)]:
@@ -86,7 +89,7 @@ def main():
         with zipfile.ZipFile(sources_path) as upstream:
             assert upstream.testzip() is None
             for name in ['ffmpeg-8.0.1.tar.xz', 'zlib-1.3.1.tar.gz']:
-                assert any(path.endswith('/' + name) for path in upstream.namelist()), name
+                assert any(path == name or path.endswith('/' + name) for path in upstream.namelist()), name
         print('PASS corresponding application source and accompanying bundled media source present')
     subprocess.run(['/usr/lib/wine/wineserver64', '-k'], env=env, timeout=20, check=False)
 

@@ -11,6 +11,8 @@ import subprocess
 import tempfile
 import unittest
 import zipfile
+from unittest.mock import patch
+from release_common import verify_media, SOURCES, sha256
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location('release', ROOT/'scripts/package-release.py')
@@ -27,7 +29,7 @@ class ReleaseTests(unittest.TestCase):
             wxs = path/'app.wxs'; release.wix(payload,wxs)
             text = wxs.read_text()
             self.assertIn(release.UPGRADE_CODE,text)
-            self.assertIn('Version="0.2.0"',text)
+            self.assertIn(f'Version="{release.MSI_VERSION}"',text)
             self.assertIn('InstallScope="perUser"',text)
             self.assertIn('MajorUpgrade',text)
             self.assertNotIn('RemoveFile',text)
@@ -43,38 +45,111 @@ class ReleaseTests(unittest.TestCase):
             subprocess.run(['openssl','genpkey','-algorithm','ED25519','-out',str(key)],check=True)
             public = subprocess.check_output(['openssl','pkey','-in',str(key),'-pubout','-outform','DER'])
             (repo/'packaging/update-public-key.hex').write_text(public[-32:].hex())
-            msi = path/'m4b-Craft-0.2.0-alpha.1-windows-x86_64.msi'; msi.write_bytes(b'test fixture')
-            output = path/'update.json'
-            subprocess.run(['python3',str(repo/'scripts/sign-update.py'),'--key',str(key),
-                '--msi',str(msi),'--version','0.2.0-alpha.1','--out',str(output),'--scratch',str(path)],check=True)
-            envelope = json.loads(output.read_text())
-            manifest = json.loads(envelope['payload'])
-            self.assertEqual(manifest['size'],msi.stat().st_size)
-            self.assertEqual(manifest['sha256'],hashlib.sha256(msi.read_bytes()).hexdigest())
-            self.assertEqual(manifest['filename'],msi.name)
-            payload = path/'payload'; payload.write_text(envelope['payload']+' ')
-            signature = path/'signature'; signature.write_bytes(bytes.fromhex(envelope['signature']))
-            pub = path/'pub.der'; pub.write_bytes(public)
-            result = subprocess.run(['openssl','pkeyutl','-verify','-rawin','-pubin','-keyform','DER',
-                '-inkey',str(pub),'-in',str(payload),'-sigfile',str(signature)],capture_output=True)
-            self.assertNotEqual(result.returncode,0)
+            for platform, extension in [('windows-x86_64','msi'),('macos-aarch64','dmg')]:
+                with self.subTest(platform=platform):
+                    installer = path/f'm4b-Craft-0.3.0-alpha.1-{platform}.{extension}'
+                    installer.write_bytes(b'test fixture')
+                    output = path/'update.json'
+                    command = ['python3',str(repo/'scripts/sign-update.py'),'--key',str(key),
+                        '--installer',str(installer),'--platform',platform,'--version','0.3.0-alpha.1',
+                        '--out',str(output),'--scratch',str(path)]
+                    subprocess.run(command,check=True,capture_output=True)
+                    envelope = json.loads(output.read_text())
+                    self.assertEqual(set(envelope),{'payload','signature'})
+                    manifest = json.loads(envelope['payload'])
+                    self.assertEqual(set(manifest),{'version','platform','filename','sha256','size','url'})
+                    self.assertEqual(manifest['platform'],platform)
+                    self.assertEqual(manifest['size'],installer.stat().st_size)
+                    self.assertEqual(manifest['sha256'],sha256(installer))
+                    self.assertEqual(manifest['filename'],installer.name)
+                    self.assertEqual(manifest['url'],f'https://github.com/aruel-perso/m4b-craft/releases/download/v0.3.0-alpha.1/{installer.name}')
+                    payload = path/'payload'; payload.write_bytes(envelope['payload'].encode('utf-8'))
+                    signature = path/'signature'; signature.write_bytes(bytes.fromhex(envelope['signature']))
+                    pub = path/'pub.der'; pub.write_bytes(public)
+                    verify = ['openssl','pkeyutl','-verify','-rawin','-pubin','-keyform','DER',
+                        '-inkey',str(pub),'-in',str(payload),'-sigfile',str(signature)]
+                    self.assertEqual(subprocess.run(verify,capture_output=True).returncode,0)
+                    payload.write_bytes(payload.read_bytes()+b' ')
+                    self.assertNotEqual(subprocess.run(verify,capture_output=True).returncode,0)
+                    wrong = command.copy(); wrong[wrong.index('--platform')+1] = 'macos-aarch64' if platform == 'windows-x86_64' else 'windows-x86_64'
+                    result = subprocess.run(wrong,capture_output=True)
+                    self.assertNotEqual(result.returncode,0)
+                    self.assertIn(b'Expected filename',result.stderr)
+                    if platform == 'windows-x86_64':
+                        legacy = command.copy(); legacy[legacy.index('--installer')] = '--msi'
+                        self.assertEqual(subprocess.run(legacy,capture_output=True).returncode,0)
+                    for invalid in ['0.3.0-alpha.01','v0.3.0','0.3.0+build']:
+                        bad = command.copy(); bad[bad.index('--version')+1] = invalid
+                        self.assertNotEqual(subprocess.run(bad,capture_output=True).returncode,0)
     def test_signing_refuses_wrong_external_key(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as d:
             path = Path(d)
             key = path/'key.pem'
             subprocess.run(['openssl','genpkey','-algorithm','ED25519','-out',str(key)],check=True)
-            msi = path/'m4b-Craft-0.2.0-alpha.1-windows-x86_64.msi'; msi.write_bytes(b'test fixture')
+            msi = path/'m4b-Craft-0.3.0-alpha.1-windows-x86_64.msi'; msi.write_bytes(b'test fixture')
             output = path/'update.json'
             result = subprocess.run(['python3',str(ROOT/'scripts/sign-update.py'),'--key',str(key),
-                '--msi',str(msi),'--version','0.2.0-alpha.1','--out',str(output),'--scratch',str(path)],capture_output=True)
+                '--msi',str(msi),'--version','0.3.0-alpha.1','--out',str(output),'--scratch',str(path)],capture_output=True)
             self.assertNotEqual(result.returncode,0)
             self.assertIn(b'does not match pinned public key',result.stderr)
             self.assertFalse(output.exists())
 
+    def test_media_cache_requires_exact_records_and_pinned_sources(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as d:
+            media = Path(d)
+            names = ['ffmpeg','ffprobe','config.h','config_components.h','config.mak',
+                     'COPYING.LGPLv2.1','LICENSE.md','LICENSE.zlib','zlib-config.txt'] + list(SOURCES)
+            for name in names: (media/name).write_bytes(b'fixture')
+            def manifest():
+                (media/'SHA256SUMS').write_text(''.join(sha256(media/name)+'  '+name+'\n' for name in names))
+            manifest()
+            with self.assertRaisesRegex(ValueError,'Unpinned source'): verify_media(media,'macos-aarch64')
+            with patch.dict(SOURCES,{name:sha256(media/name) for name in SOURCES}):
+                verify_media(media,'macos-aarch64')
+                (media/'ffmpeg').write_bytes(b'corrupted')
+                with self.assertRaisesRegex(ValueError,'checksum mismatch'): verify_media(media,'macos-aarch64')
+                manifest()
+                names.remove('ffprobe'); manifest()
+                with self.assertRaisesRegex(ValueError,'cache contents'): verify_media(media,'macos-aarch64')
+
+    def test_macho_rejects_external_dylibs_and_wrong_architecture(self):
+        spec = importlib.util.spec_from_file_location('macho',ROOT/'scripts/verify-macos.py')
+        macho = importlib.util.module_from_spec(spec); spec.loader.exec_module(macho)
+        for arch, dependency, accepted in [
+            ('arm64','/usr/lib/libSystem.B.dylib',True),
+            ('arm64','/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit',True),
+            ('x86_64','/usr/lib/libSystem.B.dylib',False),
+            ('arm64 x86_64','/usr/lib/libSystem.B.dylib',False),
+            ('arm64','/opt/homebrew/lib/libz.1.dylib',False),
+            ('arm64','@rpath/libz.1.dylib',False),
+            ('arm64','/usr/local/lib/libz.1.dylib',False)]:
+            with self.subTest(arch=arch,dependency=dependency):
+                with patch.object(macho.subprocess,'check_output',side_effect=[arch+'\n',f'fixture:\n\t{dependency} (compatibility version 1.0.0, current version 1.0.0)\n']):
+                    if accepted: macho.verify(Path('fixture'))
+                    else:
+                        with self.assertRaises(ValueError): macho.verify(Path('fixture'))
+
+    def test_flat_assets_fail_on_missing_nested_or_changed_files(self):
+        spec = importlib.util.spec_from_file_location('assets',ROOT/'scripts/verify-release-assets.py')
+        assets = importlib.util.module_from_spec(spec); spec.loader.exec_module(assets)
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as d:
+            directory = Path(d)
+            for platform, extensions in [('windows-x86_64',['msi','zip']),('macos-aarch64',['dmg'])]:
+                for suffix in ['.'+ext for ext in extensions]+['-media-sources.zip']:
+                    file = directory/f'm4b-Craft-0.3.0-alpha.1-{platform}{suffix}'
+                    file.write_bytes(b'fixture')
+                    file.with_name(file.name+'.sha256').write_text(sha256(file)+'  '+file.name+'\n')
+            assets.verify(directory,'0.3.0-alpha.1')
+            extra = directory/'nested'; extra.mkdir()
+            with self.assertRaises(ValueError): assets.verify(directory,'0.3.0-alpha.1')
+            extra.rmdir()
+            next(directory.glob('*.dmg')).write_bytes(b'changed')
+            with self.assertRaisesRegex(ValueError,'Checksum mismatch'): assets.verify(directory,'0.3.0-alpha.1')
+
 def inspect(msi, scratch):
     tool = os.environ.get('MSIINFO','msiinfo')
     properties = subprocess.check_output([tool,'export',str(msi),'Property']).decode()
-    for value in [release.UPGRADE_CODE.upper(), '0.2.0','m4b-Craft']:
+    for value in [release.UPGRADE_CODE.upper(), release.MSI_VERSION,'m4b-Craft']:
         assert value.lower() in properties.lower(),value
     files = subprocess.check_output([tool,'export',str(msi),'File']).decode()
     for name in ['m4b-Craft.exe','m4b-cli.exe','ffmpeg.exe','ffprobe.exe','Cargo.lock','LICENSE']:

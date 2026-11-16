@@ -90,3 +90,49 @@ A Wine MSI execution attempt was blocked before installation: wineserver cannot 
 - Executed the actual generated MSI under Wine/Xvfb: per-user installation under LocalAppData, installed CLI version 0.2.0-alpha.1, bundled AAC encoder availability, installed application/source files and Start menu shortcut passed. Uninstallation removed the executable while leaving an external project and asset preservation fixture unchanged. This is actual Wine installation/uninstallation evidence, not native Windows certification or a real prior-version upgrade.
 - Corrected installer handoff: after re-verification and explicit confirmation, spawn the system Windows Installer and close the saved/idle editor so its executable is not locked during replacement. The verified MSI remains available across process exit; launch failure preserves the editor and removes the retained MSI.
 - The release signing secret is configured in a GitHub environment restricted to `v*` tags. Public source contains only the pinned public key; the private key stays outside the repository and in the encrypted GitHub environment secret. GitHub workflow/release execution status is authoritative on the repository Actions/Releases pages.
+
+## 0.3.0-alpha.1 Windows + native Mac release tooling
+
+This section records the scoped packaging work on `release/macos-0.3`, superseding
+older release-status statements above where applicable. The branch is an isolated
+worktree. Cargo.toml/Cargo.lock, crates, BRIEF.md and the pinned updater public key
+were not changed by this work. Root Cargo version is still the earlier version in
+this snapshot; the Rust owner's separate 0.3.0-alpha.1 bump and updater implementation
+must be merged before tagging. Current packagers discover that version dynamically.
+
+Local host is Linux x86_64. No macOS executable, hdiutil, codesign, lipo or otool was
+run here. No build target/media bundle was duplicated and no full Rust/media rebuild
+was performed for these script/document changes. No system installation, push,
+tag, release or release API call was performed. The original linked worktree Git metadata is read-only under `/srv`, so staging/
+commit there failed with `index.lock: Read-only file system`. A scoped commit is
+prepared on the same-named branch in writable scratch Git metadata, with a Git
+bundle for transfer; the original worktree branch reference remains unchanged. Historical Rust/Wine/MSI results above remain historical evidence,
+not a new test of 0.3.0 or a native Windows certification.
+
+Local checks actually executed successfully:
+
+- `TMPDIR=/root/.hermes/cache/scratch python3 scripts/test-release.py --scratch /root/.hermes/cache/scratch`: **6 tests passed**. Real temporary Ed25519 keys/OpenSSL signatures exercise both platform payloads, exact envelope/payload field sets and UTF-8 signature bytes, signature tampering, wrong pinned key, filename/platform mismatch, canonical semver and the backwards-compatible Windows `--msi` call. The repository public key is not replaced; fixture repositories receive fixture keys only.
+- The same suite checks generated WiX identity/per-user layout, strict media-cache records and source pinning, flat two-platform release staging/checksum refusal. Mocked lipo/otool output tests ARM64-only/system-dylib policy, rejection of x86_64/universal binaries, Homebrew/local libraries and `@rpath`. **Mocks are not real Mac execution evidence.**
+- `TMPDIR=/root/.hermes/cache/scratch python3 scripts/test-source-fetch.py`: **4 tests passed**, covering HTTP-success challenge rejection/fallback, all-sources failure, verified cache reuse and corrupt-cache replacement. Transport fixtures do not download upstream bytes or prove current upstream availability.
+- `python3 -m compileall -q scripts`: passed.
+- `bash -n scripts/build-ffmpeg-macos.sh scripts/build-ffmpeg-windows.sh scripts/ffmpeg-options.sh scripts/fetch-media-sources.sh`: passed.
+- Workflow YAML parsed successfully using the already available Prettier YAML parser at `/root/.hermes/lsp/node_modules/prettier/plugins/yaml.js`. This is syntax validation, not a hosted workflow run or actionlint validation.
+- `git diff --check`: passed. Final scoped staged diff checked before commit.
+
+**Pending, not tested:** the new native `macos-15` CI job, native Cargo workspace
+suite on Mac, actual AppleSilicon FFmpeg/zlib build, real Mach-O/dylib inspection,
+ad-hoc bundle signatures, creation/mounting of the DMG, writable simulated install
+and installed CLI PCM→M4B export/import/probe/re-export. The workflow implements all
+of these checks and will fail if any fails; only successful actual CI logs may
+promote them to passed. The current public runner label was checked against GitHub's
+[official hosted-runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners);
+the job independently asserts `uname -m = arm64`.
+
+Also pending: a new Windows packaging CI run after the shared-option/cache changes;
+real Windows install/upgrade/uninstall; real Mac Applications installation/replacement;
+GUI launch/interaction on Mac; Finder `.m4bproj` open events; Gatekeeper/quarantine
+behavior; minimum macOS 11 testing; live two-platform signed update discovery,
+download and consent/handoff. No GUI test, Developer ID, notarization, Authenticode,
+public release success or native platform acceptance is claimed. The manifest secret
+remains confined to the tag-only protected release environment; the release job
+requires both platform jobs to pass before signing and publishing either platform.

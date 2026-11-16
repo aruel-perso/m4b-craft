@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the 0.2 release payload and WiX MSI; never uses old alpha artifacts.
+"""Build the Windows release payload and WiX MSI; never uses old alpha artifacts.
 Requires freshly built Windows GNU release binaries, wixl and locked Cargo sources.
 """
 import argparse
@@ -16,8 +16,8 @@ import zipfile
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '0.2.0-alpha.1'
-MSI_VERSION = '0.2.0'
+from release_common import VERSION, verify_media, copy_source, copy_licenses, checksums
+MSI_VERSION = VERSION.split('-')[0]
 UPGRADE_CODE = '790fce8b-e564-43b1-9701-d427fdd80c6c'
 NAME = f'm4b-Craft-{VERSION}-windows-x86_64'
 NS = 'http://schemas.microsoft.com/wix/2006/wi'
@@ -96,7 +96,7 @@ def archive(directory, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--wixl', default='wixl')
-    parser.add_argument('--out', type=Path, default=ROOT/'dist/release-0.2.0-alpha.1')
+    parser.add_argument('--out', type=Path, default=ROOT/f'dist/release-{VERSION}')
     parser.add_argument('--scratch', type=Path, default=Path(os.environ.get('TMPDIR','/root/.hermes/cache/scratch')))
     args = parser.parse_args()
     version = subprocess.check_output(['cargo','metadata','--no-deps','--format-version=1'], cwd=ROOT)
@@ -114,26 +114,15 @@ def main():
         for source, target in [('m4b-desktop.exe','m4b-Craft.exe'),('m4b-cli.exe','m4b-cli.exe')]:
             shutil.copy2(binaries/source, payload/target)
         media = ROOT/'vendor/windows-media'
-        for line in (media/'SHA256SUMS').read_text().splitlines():
-            digest, name = line.split(maxsplit=1)
-            file = media/Path(name.strip()).name
-            if hashlib.sha256(file.read_bytes()).hexdigest() != digest:
-                raise SystemExit(f'Media checksum mismatch: {file.name}')
-        if hashlib.sha256((media/'zlib-1.3.1.tar.gz').read_bytes()).hexdigest() != '9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23':
-            raise SystemExit('zlib source checksum mismatch')
+        verify_media(media, 'windows-x86_64')
         for name in ['ffmpeg.exe','ffprobe.exe']:
             shutil.copy2(media/name, payload/name)
         for executable in payload.glob('*.exe'): verify_pe(executable)
         shutil.copy2(ROOT/'LICENSE', payload/'LICENSE')
+        for name in ['Lancer-m4b-Craft.cmd','LISEZ-MOI-WINDOWS.txt']:
+            shutil.copy2(ROOT/'packaging/windows'/name, payload/name)
         source = payload/'source'
-        source.mkdir()
-        for name in ['crates','.cargo','.github','scripts','packaging']:
-            for entry in (ROOT/name).rglob('*'):
-                if entry.is_symlink() or entry.suffix.lower() in ('.pem','.key'):
-                    raise SystemExit(f'Refusing private key or symlink in release source: {entry}')
-            shutil.copytree(ROOT/name, source/name, ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
-        for name in ['Cargo.toml','Cargo.lock','.gitignore','.gitattributes','LICENSE','README.md','BRIEF.md','ROADMAP.md','VALIDATION.md','RELEASE.md']:
-            shutil.copy2(ROOT/name, source/name)
+        copy_source(source)
         third = source/'third-party/ffmpeg'
         third.mkdir(parents=True)
         for file in media.iterdir():
@@ -146,18 +135,7 @@ def main():
             shutil.copy2(media/name, upstream/name)
         archive(upstream, output/f'{NAME}-media-sources.zip')
         (payload/'MEDIA-SOURCES.txt').write_text(f'Corresponding FFmpeg/zlib source: {NAME}-media-sources.zip, supplied alongside this MSI. Build recipe and configuration: source/.\n')
-        metadata = json.loads(subprocess.check_output(['cargo','metadata','--locked','--offline','--format-version=1'],cwd=ROOT))
-        notices = []
-        for package in metadata['packages']:
-            if not package.get('source'): continue
-            notices.append(f"{package['name']} {package['version']}: {package.get('license')}")
-            base = Path(package['manifest_path']).parent
-            for file in base.iterdir():
-                if file.is_file() and file.name.upper().startswith(('LICENSE','LICENCE','COPYING','NOTICE','COPYRIGHT')):
-                    dest = payload/'licenses'/f"{package['name']}-{package['version']}"/file.name
-                    dest.parent.mkdir(parents=True,exist_ok=True)
-                    shutil.copy2(file,dest)
-        (payload/'THIRD-PARTY-NOTICES.txt').write_text('\n'.join(sorted(notices))+'\n')
+        copy_licenses(payload)
         retained = output/'payload'
         if retained.exists(): shutil.rmtree(retained)
         shutil.copytree(payload, retained)
@@ -166,9 +144,7 @@ def main():
         subprocess.run([args.wixl,'-a','x64','-o',str(output/f'{NAME}.msi'),str(wxs)], check=True)
         archive(payload,output/f'{NAME}.zip')
     # Retained payload and generated WiX source allow MSI inspection/rebuilding.
-    for file in sorted(output.iterdir()):
-        if file.suffix in ('.msi','.zip'):
-            file.with_name(file.name+'.sha256').write_text(hashlib.sha256(file.read_bytes()).hexdigest()+'  '+file.name+'\n')
+    checksums(output)
     print(output)
 
 if __name__ == '__main__': main()
