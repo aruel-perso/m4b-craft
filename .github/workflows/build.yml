@@ -18,7 +18,7 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     env:
-      TMPDIR: ${{ runner.temp }}/m4b-release
+      TMPDIR: /home/runner/m4b-release-${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
       - run: mkdir -p "$TMPDIR"
@@ -72,7 +72,7 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     env:
-      TMPDIR: ${{ runner.temp }}/m4b-release
+      TMPDIR: /home/runner/m4b-release-${{ github.run_id }}
     environment: release
     permissions:
       contents: write
