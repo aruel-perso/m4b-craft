@@ -1,0 +1,918 @@
+mod assets;
+mod sevenzip;
+mod zip;
+// Portable project model and media contracts. Only `DesktopFfmpeg` spawns processes.
+use anyhow::{bail, ensure, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::{
+    cmp::Ordering,
+    fs,
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        mpsc, Arc,
+    },
+    time::Duration,
+};
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Metadata {
+    pub title: String,
+    pub author: String,
+    pub narrator: String,
+    pub description: String,
+    pub genre: String,
+    pub date: String,
+    pub copyright: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Track {
+    pub path: PathBuf,
+    pub duration_ms: u64,
+    pub codec: String,
+    pub sample_rate: u32,
+    pub channels: u32,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Chapter {
+    pub start_ms: u64,
+    pub title: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Settings {
+    pub language: String,
+    pub theme: String,
+    pub bitrate_kbps: u32,
+}
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            language: "en".into(),
+            theme: "system".into(),
+            bitrate_kbps: 96,
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Project {
+    #[serde(default)]
+    pub name: String,
+    pub version: u32,
+    pub metadata: Metadata,
+    pub tracks: Vec<Track>,
+    pub chapters: Vec<Chapter>,
+    pub cover: Option<PathBuf>,
+    pub settings: Settings,
+}
+impl Default for Project {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            version: 1,
+            metadata: Metadata::default(),
+            tracks: vec![],
+            chapters: vec![],
+            cover: None,
+            settings: Settings::default(),
+        }
+    }
+}
+impl Project {
+    pub fn named(name: &str) -> Result<Self> {
+        ensure!(!name.trim().is_empty(), "Project name is required");
+        let mut project = Self {
+            name: name.trim().to_owned(),
+            ..Self::default()
+        };
+        project.metadata.title = project.name.clone();
+        Ok(project)
+    }
+    pub fn duration_ms(&self) -> u64 {
+        self.tracks
+            .iter()
+            .fold(0u64, |sum, t| sum.saturating_add(t.duration_ms))
+    }
+    pub fn estimated_bytes(&self) -> u64 {
+        self.duration_ms()
+            .saturating_mul(u64::from(self.settings.bitrate_kbps))
+            / 8
+    }
+    pub fn reset_chapters(&mut self) {
+        let mut start = 0u64;
+        self.chapters = self
+            .tracks
+            .iter()
+            .map(|t| {
+                let c = Chapter {
+                    start_ms: start,
+                    title: t
+                        .path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into(),
+                };
+                start = start.saturating_add(t.duration_ms);
+                c
+            })
+            .collect();
+    }
+    pub fn import(&mut self, backend: &dyn MediaBackend, mut paths: Vec<PathBuf>) -> Result<()> {
+        paths.sort_by(|a, b| {
+            natural_cmp(
+                &a.file_name().unwrap_or(a.as_os_str()).to_string_lossy(),
+                &b.file_name().unwrap_or(b.as_os_str()).to_string_lossy(),
+            )
+            .then_with(|| natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()))
+        });
+        // Probe all before mutating the project, so failed batches are transactional.
+        let tracks: Result<Vec<_>> = paths
+            .iter()
+            .map(|p| backend.probe(p).map(|v| v.track))
+            .collect();
+        let tracks = tracks?;
+        if self.tracks.is_empty()
+            && paths.len() == 1
+            && paths[0]
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("m4b") || e.eq_ignore_ascii_case("m4a"))
+        {
+            let info = backend.probe(&paths[0])?;
+            self.metadata = info.metadata;
+            self.chapters = info.chapters;
+            if info.has_cover {
+                self.cover = Some(info.track.path.clone());
+            }
+            self.tracks = tracks;
+            if self.chapters.is_empty() {
+                self.reset_chapters();
+            }
+            return Ok(());
+        }
+        self.tracks.extend(tracks);
+        self.reset_chapters();
+        Ok(())
+    }
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.version == 1,
+            "Unsupported project version {}",
+            self.version
+        );
+        ensure!(!self.tracks.is_empty(), "No audio tracks");
+        ensure!(
+            self.tracks
+                .iter()
+                .try_fold(0u64, |sum, t| sum.checked_add(t.duration_ms))
+                .is_some(),
+            "Project duration overflow"
+        );
+        ensure!(
+            [48, 64, 96, 128, 160, 192, 256, 320].contains(&self.settings.bitrate_kbps),
+            "Unsupported AAC bitrate"
+        );
+        ensure!(
+            self.tracks
+                .iter()
+                .all(|t| t.duration_ms > 0 && t.path.is_file()),
+            "Missing or empty source track"
+        );
+        ensure!(
+            self.chapters.first().map(|c| c.start_ms) == Some(0),
+            "First chapter must start at 0"
+        );
+        ensure!(
+            self.chapters
+                .windows(2)
+                .all(|w| w[0].start_ms < w[1].start_ms),
+            "Chapter starts must strictly increase"
+        );
+        ensure!(
+            self.chapters
+                .iter()
+                .all(|c| c.start_ms < self.duration_ms()),
+            "Chapter outside audio duration"
+        );
+        if let Some(p) = &self.cover {
+            ensure!(p.is_file(), "Cover does not exist");
+        }
+        Ok(())
+    }
+    pub fn save(&self, path: &Path) -> Result<()> {
+        self.write_project(path, true)
+    }
+    /// Creates a project atomically and refuses an existing destination.
+    pub fn save_new(&self, path: &Path) -> Result<()> {
+        self.write_project(path, false)
+    }
+    fn write_project(&self, path: &Path, replace: bool) -> Result<()> {
+        if let Ok(target) = dunce::canonicalize(path) {
+            for source in self.tracks.iter().map(|t| &t.path).chain(self.cover.iter()) {
+                ensure!(
+                    dunce::canonicalize(source).ok().as_ref() != Some(&target),
+                    "Cannot save project over a source or cover"
+                );
+            }
+        }
+        let parent = parent_dir(path);
+        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer_pretty(&mut temp, self)?;
+        temp.flush()?;
+        temp.as_file().sync_all()?;
+        if replace {
+            temp.persist(path).map_err(|e| e.error)?;
+        } else {
+            temp.persist_noclobber(path).map_err(|e| e.error)?;
+        }
+        Ok(())
+    }
+    pub fn load(path: &Path) -> Result<Self> {
+        let mut p: Self = serde_json::from_reader(fs::File::open(path)?)?;
+        ensure!(p.version == 1, "Unsupported project version");
+        let base = dunce::canonicalize(path)?
+            .parent()
+            .context("Project has no parent")?
+            .to_path_buf();
+        for t in &mut p.tracks {
+            if t.path.is_relative() {
+                t.path = base.join(&t.path);
+            }
+        }
+        if let Some(c) = &mut p.cover {
+            if c.is_relative() {
+                *c = base.join(&*c);
+            }
+        }
+        Ok(p)
+    }
+}
+fn parent_dir(p: &Path) -> &Path {
+    p.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+pub fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let a = a.to_lowercase();
+    let b = b.to_lowercase();
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i].is_ascii_digit() && b[j].is_ascii_digit() {
+            let (si, sj) = (i, j);
+            while i < a.len() && a[i].is_ascii_digit() {
+                i += 1;
+            }
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            let x = a[si..i]
+                .iter()
+                .position(|c| *c != b'0')
+                .map(|n| &a[si + n..i])
+                .unwrap_or(&[]);
+            let y = b[sj..j]
+                .iter()
+                .position(|c| *c != b'0')
+                .map(|n| &b[sj + n..j])
+                .unwrap_or(&[]);
+            let c = x.len().cmp(&y.len()).then_with(|| x.cmp(y));
+            if c != Ordering::Equal {
+                return c;
+            }
+        } else {
+            let c = a[i].cmp(&b[j]);
+            if c != Ordering::Equal {
+                return c;
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+    (a.len() - i).cmp(&(b.len() - j)).then_with(|| a.cmp(b))
+}
+#[derive(Clone, Debug)]
+pub struct Probe {
+    pub track: Track,
+    pub metadata: Metadata,
+    pub chapters: Vec<Chapter>,
+    pub has_cover: bool,
+}
+#[derive(Clone, Debug)]
+pub enum ExportEvent {
+    Log(String),
+    Progress(f32),
+}
+pub type Cancel = Arc<AtomicBool>;
+pub trait MediaBackend: Send + Sync {
+    fn probe(&self, path: &Path) -> Result<Probe>;
+    fn encoders(&self) -> Result<Vec<String>>;
+    fn export(
+        &self,
+        project: &Project,
+        output: &Path,
+        cancel: Cancel,
+        event: &mut dyn FnMut(ExportEvent),
+    ) -> Result<()>;
+}
+#[derive(Clone, Debug)]
+pub struct DesktopFfmpeg {
+    pub ffmpeg: PathBuf,
+    pub ffprobe: PathBuf,
+}
+impl Default for DesktopFfmpeg {
+    fn default() -> Self {
+        let directory = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf));
+        Self::discover_in(directory.as_deref())
+    }
+}
+impl DesktopFfmpeg {
+    /// Prefer the packaged tools beside the executable, independent of CWD/PATH.
+    /// PATH fallback supports developer builds and system-provided tools on Linux.
+    pub fn discover_in(directory: Option<&Path>) -> Self {
+        fn locate(directory: Option<&Path>, name: &str) -> PathBuf {
+            let executable = if cfg!(windows) {
+                format!("{name}.exe")
+            } else {
+                name.into()
+            };
+            if let Some(candidate) = directory.map(|dir| dir.join(&executable)) {
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+            executable.into()
+        }
+        Self {
+            ffmpeg: locate(directory, "ffmpeg"),
+            ffprobe: locate(directory, "ffprobe"),
+        }
+    }
+}
+fn command(path: &Path) -> Command {
+    let mut c = Command::new(path);
+    c.stdin(Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x08000000);
+    }
+    c
+}
+impl DesktopFfmpeg {
+    /// Opens an M4B as a single source while retaining its chapter timeline and tags.
+    pub fn open(&self, path: &Path) -> Result<Project> {
+        let info = self.probe(path)?;
+        let mut p = Project {
+            metadata: info.metadata,
+            tracks: vec![info.track],
+            chapters: info.chapters,
+            ..Project::default()
+        };
+        if info.has_cover {
+            p.cover = Some(p.tracks[0].path.clone());
+        }
+        if p.chapters.is_empty() {
+            p.reset_chapters();
+        }
+        Ok(p)
+    }
+    pub fn extract_cover(&self, input: &Path, output: &Path) -> Result<()> {
+        ensure!(!output.exists(), "Cover destination exists");
+        let s = command(&self.ffmpeg)
+            .args(["-v", "error", "-nostdin", "-n", "-i"])
+            .arg(input)
+            .args(["-map", "0:v:0", "-frames:v", "1"])
+            .arg(output)
+            .status()?;
+        ensure!(s.success(), "Cover extraction failed");
+        Ok(())
+    }
+    fn run(
+        &self,
+        args: &[std::ffi::OsString],
+        cancel: &Cancel,
+        event: &mut dyn FnMut(ExportEvent),
+        base: f32,
+        span: f32,
+        duration_ms: u64,
+    ) -> Result<()> {
+        if cancel.load(AtomicOrdering::Relaxed) {
+            bail!("Export cancelled");
+        }
+        let mut child = command(&self.ffmpeg)
+            .args([
+                "-hide_banner",
+                "-nostdin",
+                "-v",
+                "warning",
+                "-threads",
+                "1",
+                "-filter_threads",
+                "1",
+                "-filter_complex_threads",
+                "1",
+                "-progress",
+                "pipe:1",
+                "-nostats",
+            ])
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("Start ffmpeg (install it or configure its path)")?;
+        let (tx, rx) = mpsc::channel();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let tx2 = tx.clone();
+        let out_thread = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(|line| line.ok()) {
+                if tx.send((true, line)).is_err() {
+                    break;
+                }
+            }
+        });
+        let err_thread = std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(|line| line.ok()) {
+                if tx2.send((false, line)).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut last_errors = String::new();
+        let result = loop {
+            for (progress, line) in rx.try_iter() {
+                if progress {
+                    if let Some(t) = line
+                        .strip_prefix("out_time_us=")
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        event(ExportEvent::Progress(
+                            base + span
+                                * (t as f32 / (duration_ms.max(1) as f32 * 1000.)).clamp(0., 1.),
+                        ));
+                    }
+                } else {
+                    if last_errors.len() < 16384 {
+                        last_errors.push_str(&line);
+                        last_errors.push('\n');
+                    }
+                    event(ExportEvent::Log(line));
+                }
+            }
+            if cancel.load(AtomicOrdering::Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(anyhow::anyhow!("Export cancelled"));
+            }
+            match child.try_wait() {
+                Ok(Some(s)) => {
+                    break if s.success() {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("FFmpeg failed ({s}): {last_errors}"))
+                    };
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(40)),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(e.into());
+                }
+            }
+        };
+        let _ = out_thread.join();
+        let _ = err_thread.join();
+        for (progress, line) in rx.try_iter() {
+            if !progress {
+                event(ExportEvent::Log(line));
+            }
+        }
+        result
+    }
+}
+fn tag(v: &serde_json::Value, key: &str) -> String {
+    v.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .into()
+}
+fn meta_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('=', "\\=")
+        .replace(';', "\\;")
+        .replace('#', "\\#")
+        .replace('\r', "")
+        .replace('\n', "\\\n")
+}
+impl MediaBackend for DesktopFfmpeg {
+    fn probe(&self, path: &Path) -> Result<Probe> {
+        let path =
+            dunce::canonicalize(path).with_context(|| format!("Read source {}", path.display()))?;
+        let o = command(&self.ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-show_format",
+                "-show_streams",
+                "-show_chapters",
+                "-of",
+                "json",
+            ])
+            .arg(&path)
+            .output()
+            .context("Start ffprobe")?;
+        ensure!(
+            o.status.success(),
+            "ffprobe: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout)?;
+        let streams = v["streams"].as_array().context("No streams")?;
+        let audio = streams
+            .iter()
+            .find(|s| s["codec_type"] == "audio")
+            .context("No audio stream")?;
+        let duration = audio["duration"]
+            .as_str()
+            .or(v["format"]["duration"].as_str())
+            .context("Unknown duration")?
+            .parse::<f64>()?;
+        ensure!(
+            duration.is_finite() && duration > 0. && duration < 1e9,
+            "Invalid duration"
+        );
+        let tags = &v["format"]["tags"];
+        let chapters = v["chapters"]
+            .as_array()
+            .map(|cs| {
+                cs.iter()
+                    .map(|c| Chapter {
+                        start_ms: (c["start_time"]
+                            .as_str()
+                            .unwrap_or("0")
+                            .parse::<f64>()
+                            .unwrap_or(0.)
+                            * 1000.)
+                            .round() as u64,
+                        title: tag(&c["tags"], "title"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Probe {
+            track: Track {
+                path,
+                duration_ms: (duration * 1000.).round() as u64,
+                codec: tag(audio, "codec_name"),
+                sample_rate: tag(audio, "sample_rate").parse().unwrap_or(0),
+                channels: audio["channels"].as_u64().unwrap_or(0) as u32,
+            },
+            metadata: Metadata {
+                title: tag(tags, "title"),
+                author: tag(tags, "artist"),
+                narrator: tag(tags, "composer"),
+                description: tag(tags, "description"),
+                genre: tag(tags, "genre"),
+                date: tag(tags, "date"),
+                copyright: tag(tags, "copyright"),
+            },
+            chapters,
+            has_cover: streams
+                .iter()
+                .any(|s| s["disposition"]["attached_pic"] == 1),
+        })
+    }
+    fn encoders(&self) -> Result<Vec<String>> {
+        let o = command(&self.ffmpeg)
+            .args(["-hide_banner", "-encoders"])
+            .output()?;
+        ensure!(o.status.success(), "Cannot query encoders");
+        Ok(String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|l| {
+                let mut s = l.split_whitespace();
+                let flags = s.next()?;
+                let name = s.next()?;
+                if flags.starts_with('A') && name != "=" {
+                    Some(name.into())
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+    fn export(
+        &self,
+        p: &Project,
+        output: &Path,
+        cancel: Cancel,
+        event: &mut dyn FnMut(ExportEvent),
+    ) -> Result<()> {
+        p.validate()?;
+        ensure!(
+            !output.exists(),
+            "Output already exists; refusing overwrite"
+        );
+        ensure!(
+            output
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("m4b")),
+            "Output must have .m4b extension"
+        );
+        ensure!(
+            self.encoders()?.iter().any(|e| e == "aac"),
+            "This FFmpeg lacks the AAC encoder"
+        );
+        let parent = dunce::canonicalize(parent_dir(output))?;
+        let output = parent.join(output.file_name().context("Invalid output")?);
+        // Same filesystem as destination: hard-link publishes atomically with no replace.
+        let stage = tempfile::Builder::new()
+            .prefix(".m4b-craft-")
+            .tempdir_in(&parent)?;
+        let mut total = 0u64;
+        for t in &p.tracks {
+            let fresh = self.probe(&t.path)?.track;
+            ensure!(
+                fresh.duration_ms.abs_diff(t.duration_ms) <= 100,
+                "Source duration changed; reimport {}",
+                t.path.display()
+            );
+            total = total
+                .checked_add(fresh.duration_ms)
+                .context("Duration overflow")?;
+        }
+        let mut list = String::new();
+        let mut decoded_durations = Vec::new();
+        let mut elapsed = 0u64;
+        for (i, t) in p.tracks.iter().enumerate() {
+            event(ExportEvent::Log(format!(
+                "Preparing track {}: {}",
+                i + 1,
+                t.path.display()
+            )));
+            let wav = stage.path().join(format!("track{i}.wav"));
+            let args = vec![
+                "-n".into(),
+                "-i".into(),
+                t.path.as_os_str().into(),
+                "-map".into(),
+                "0:a:0".into(),
+                "-vn".into(),
+                "-ar".into(),
+                "48000".into(),
+                "-ac".into(),
+                "2".into(),
+                "-c:a".into(),
+                "pcm_s16le".into(),
+                "-rf64".into(),
+                "auto".into(),
+                wav.as_os_str().into(),
+            ];
+            self.run(
+                &args,
+                &cancel,
+                event,
+                0.45 * elapsed as f32 / total as f32,
+                0.45 * t.duration_ms as f32 / total as f32,
+                t.duration_ms,
+            )?;
+            decoded_durations.push(self.probe(&wav)?.track.duration_ms);
+            list.push_str(&format!("file 'track{i}.wav'\n"));
+            elapsed += t.duration_ms;
+        }
+        // Compressed stream durations can include encoder delay/padding. Use the
+        // decoded samples for the output timeline, retaining chapter offsets
+        // within their source track rather than accumulating padding as gaps.
+        let mut export_chapters = Vec::new();
+        for c in &p.chapters {
+            let (mut source_start, mut decoded_start) = (0u64, 0u64);
+            for (track, decoded) in p.tracks.iter().zip(&decoded_durations) {
+                if c.start_ms < source_start + track.duration_ms {
+                    let offset = c.start_ms - source_start;
+                    ensure!(
+                        offset < *decoded,
+                        "Chapter '{}' lies in discarded source padding; adjust its start",
+                        c.title
+                    );
+                    export_chapters.push(Chapter {
+                        start_ms: decoded_start + offset,
+                        title: c.title.clone(),
+                    });
+                    break;
+                }
+                source_start += track.duration_ms;
+                decoded_start += decoded;
+            }
+        }
+        total = decoded_durations.iter().sum();
+        if total != p.duration_ms() {
+            event(ExportEvent::Log(format!(
+                "Chapter timeline aligned to decoded audio: {total} ms (source headers: {} ms)",
+                p.duration_ms()
+            )));
+        }
+        fs::write(stage.path().join("concat.txt"), list)?;
+        let mut meta = String::from(";FFMETADATA1\n");
+        for (key, val) in [
+            ("title", &p.metadata.title),
+            ("artist", &p.metadata.author),
+            ("album_artist", &p.metadata.author),
+            ("composer", &p.metadata.narrator),
+            ("description", &p.metadata.description),
+            ("genre", &p.metadata.genre),
+            ("date", &p.metadata.date),
+            ("copyright", &p.metadata.copyright),
+            ("album", &p.metadata.title),
+        ] {
+            meta.push_str(&format!("{key}={}\n", meta_escape(val)));
+        }
+        for (i, c) in export_chapters.iter().enumerate() {
+            let end = export_chapters
+                .get(i + 1)
+                .map(|c| c.start_ms)
+                .unwrap_or(total);
+            meta.push_str(&format!(
+                "[CHAPTER]\nTIMEBASE=1/1000\nSTART={}\nEND={end}\ntitle={}\n",
+                c.start_ms,
+                meta_escape(&c.title)
+            ));
+        }
+        let metadata = stage.path().join("metadata.txt");
+        fs::write(&metadata, meta)?;
+        let temp = stage.path().join("output.m4b");
+        let mut args: Vec<std::ffi::OsString> = vec![
+            "-n".into(),
+            "-f".into(),
+            "concat".into(),
+            "-safe".into(),
+            "1".into(),
+            "-i".into(),
+            stage.path().join("concat.txt").into_os_string(),
+            "-f".into(),
+            "ffmetadata".into(),
+            "-i".into(),
+            metadata.into_os_string(),
+        ];
+        if let Some(cover) = &p.cover {
+            args.extend(["-i".into(), cover.as_os_str().into()]);
+        }
+        args.extend([
+            "-map".into(),
+            "0:a:0".into(),
+            "-map_metadata".into(),
+            "1".into(),
+            "-map_chapters".into(),
+            "1".into(),
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            format!("{}k", p.settings.bitrate_kbps).into(),
+        ]);
+        if p.cover.is_some() {
+            args.extend([
+                "-map".into(),
+                "2:v:0".into(),
+                "-c:v".into(),
+                "mjpeg".into(),
+                "-disposition:v:0".into(),
+                "attached_pic".into(),
+            ]);
+        }
+        args.extend([
+            "-threads:a".into(),
+            "1".into(),
+            "-threads:v".into(),
+            "1".into(),
+            "-movflags".into(),
+            "+faststart".into(),
+            "-f".into(),
+            "ipod".into(),
+            temp.as_os_str().into(),
+        ]);
+        event(ExportEvent::Log("Encoding AAC and chapters".into()));
+        self.run(&args, &cancel, event, 0.45, 0.50, total)?;
+        let check = self.probe(&temp)?;
+        ensure!(check.track.codec == "aac", "Output codec validation failed");
+        ensure!(
+            check.track.duration_ms.abs_diff(total) < 500,
+            "Output duration validation failed"
+        );
+        ensure!(
+            check.metadata.title == p.metadata.title
+                && check.metadata.author == p.metadata.author
+                && check.metadata.narrator == p.metadata.narrator
+                && check.metadata.description == p.metadata.description
+                && check.metadata.genre == p.metadata.genre
+                && check.metadata.date == p.metadata.date
+                && check.metadata.copyright == p.metadata.copyright,
+            "Output metadata validation failed"
+        );
+        ensure!(
+            check.chapters.len() == export_chapters.len()
+                && check.chapters.iter().zip(&export_chapters).all(|(a, b)| a
+                    .start_ms
+                    .abs_diff(b.start_ms)
+                    <= 2
+                    && a.title == b.title),
+            "Output chapter validation failed"
+        );
+        ensure!(
+            p.cover.is_none() || check.has_cover,
+            "Output cover validation failed"
+        );
+        // Decode the entire encoded stream to catch corrupt/truncated packets before publishing.
+        let args = vec![
+            "-xerror".into(),
+            "-i".into(),
+            temp.as_os_str().into(),
+            "-map".into(),
+            "0:a:0".into(),
+            "-f".into(),
+            "null".into(),
+            "-".into(),
+        ];
+        self.run(&args, &cancel, event, 0.95, 0.04, total)?;
+        ensure!(!cancel.load(AtomicOrdering::Relaxed), "Export cancelled");
+        // FlushFileBuffers on Windows requires a write-capable handle.
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&temp)?
+            .sync_all()?;
+        fs::hard_link(&temp,
+                    &output).context("Atomic no-overwrite publication failed (destination filesystem must support hard links)")?;
+        event(ExportEvent::Progress(1.));
+        event(ExportEvent::Log(format!("Saved {}", output.display())));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn natural_order() {
+        let mut a = vec!["track10", "track2", "track1"];
+        a.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(a, vec!["track1", "track2", "track10"]);
+        assert_eq!(natural_cmp("a01", "a1x"), Ordering::Less);
+        assert_eq!(
+            natural_cmp("a999999999999999999999", "a10"),
+            Ordering::Greater
+        );
+    }
+    #[test]
+    fn persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project.json");
+        let mut p = Project::default();
+        p.metadata.title = "Écoute\n=;#".into();
+        p.save(&path).unwrap();
+        assert_eq!(
+            Project::load(&path).unwrap().metadata.title,
+            p.metadata.title
+        );
+        p.metadata.title = "Updated".into();
+        assert!(p.save_new(&path).is_err());
+        assert_ne!(Project::load(&path).unwrap().metadata.title, "Updated");
+        p.save(&path).unwrap();
+        assert_eq!(Project::load(&path).unwrap().metadata.title, "Updated");
+    }
+    #[test]
+    fn invalid_chapters() {
+        let mut p = Project::default();
+        assert!(p.validate().is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.wav");
+        fs::write(&path, b"source bytes").unwrap();
+        p.tracks.push(Track {
+            path: path.clone(),
+            duration_ms: 2000,
+            codec: "pcm_s16le".into(),
+            sample_rate: 48000,
+            channels: 2,
+        });
+        p.reset_chapters();
+        assert!(p.validate().is_ok());
+        assert!(p.save(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"source bytes");
+        p.chapters[0].start_ms = 1;
+        assert!(p.validate().is_err());
+        p.chapters[0].start_ms = 0;
+        p.chapters.push(Chapter {
+            start_ms: 2000,
+            title: "outside".into(),
+        });
+        assert!(p.validate().is_err());
+        p.chapters[1].start_ms = 0;
+        assert!(p.validate().is_err());
+        p.chapters[1].start_ms = 1000;
+        assert!(p.validate().is_ok());
+    }
+}

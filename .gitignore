@@ -1,0 +1,15 @@
+/target/
+/dist/
+__pycache__/
+*.pyc
+*.m4b
+*.wav
+*.autosave.json
+/vendor/
+.env
+.env.*
+*.pem
+*.key
+*.token
+*.assets/
+
