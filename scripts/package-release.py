@@ -132,7 +132,7 @@ def main():
                 if entry.is_symlink() or entry.suffix.lower() in ('.pem','.key'):
                     raise SystemExit(f'Refusing private key or symlink in release source: {entry}')
             shutil.copytree(ROOT/name, source/name, ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
-        for name in ['Cargo.toml','Cargo.lock','.gitignore','LICENSE','README.md','BRIEF.md','ROADMAP.md','VALIDATION.md','RELEASE.md']:
+        for name in ['Cargo.toml','Cargo.lock','.gitignore','.gitattributes','LICENSE','README.md','BRIEF.md','ROADMAP.md','VALIDATION.md','RELEASE.md']:
             shutil.copy2(ROOT/name, source/name)
         third = source/'third-party/ffmpeg'
         third.mkdir(parents=True)
