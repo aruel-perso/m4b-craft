@@ -61,9 +61,9 @@ jobs:
         with:
           name: windows-release
           path: |
-            dist/release-*/*.msi
-            dist/release-*/*.zip
-            dist/release-*/*.sha256
+            dist/release-0.2.0-alpha.1/*.msi
+            dist/release-0.2.0-alpha.1/*.zip
+            dist/release-0.2.0-alpha.1/*.sha256
           if-no-files-found: error
   release:
     if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'aruel-perso/m4b-craft'
