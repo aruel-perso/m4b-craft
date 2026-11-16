@@ -1,0 +1,71 @@
+m4b-Craft 0.1.1 - ALPHA AUTONOME Windows x86-64
+================================================
+FR
+--
+Extraire TOUS les fichiers du ZIP dans un dossier, puis ouvrir m4b-Craft.exe
+ou Lancer-m4b-Craft.cmd. Windows 11 x86-64 est la cible prioritaire.
+
+AUDIO : FFmpeg et ffprobe sont deja fournis pour la lecture et l'export.
+RAR/7Z : fournir 7z.exe ou 7zz.exe (et ses composants requis) a cote de
+l'application ou dans le PATH. Archiveur optionnel, non fourni ni telecharge.
+ZIP stocke/Deflate fonctionne sans archiveur externe. Archives chiffrees refusees.
+Pas de modification du PATH, pas de lecteur externe et pas de telechargement
+au premier lancement. Garder les deux composants a cote de l'application.
+Le materiel/pilote graphique Windows doit prendre en charge OpenGL 3.3.
+Une sortie audio Windows fonctionnelle est necessaire pour entendre la lecture.
+
+PREECOUTE INCLUSE : chaque piste et chaque chapitre dispose d'un bouton Ecouter.
+Le panneau Pre-ecoute permet pause/reprise/arret, volume et deplacement dans
+la piste. Le temps affiche provient des echantillons consommes par le lecteur.
+Les fichiers MP3, WAV, FLAC, M4A/M4B et autres formats decodables par le moteur
+fourni sont lus en flux, sans decoder tout le livre en memoire au prealable.
+Pour verifier un M4B exporte, l'ouvrir puis utiliser Ecouter sur sa piste/chapitres.
+L'export arrete la preecoute. Pas encore d'enchainement automatique des pistes
+ni d'extrait encode comparatif.
+
+Creation : Importer pistes -> ajuster l'ordre -> remplir les metadonnees,
+choisir une couverture -> modifier les chapitres -> debit AAC -> Exporter M4B.
+Reordonner/importer/supprimer une piste REINITIALISE les chapitres personnalises.
+Le menu Projet propose Nouveau/Ouvrir/Enregistrer/Enregistrer sous/Exporter.
+Les modifications non enregistrees declenchent Enregistrer/Ignorer/Annuler.
+Un export ne remplace jamais un fichier existant. Utiliser un disque local NTFS.
+FAT/exFAT et certains partages reseau ne sont pas pris en charge pour l'export.
+Prevoir environ 11,5 Mo par minute de livre pour les fichiers temporaires PCM,
+plus le fichier final. Pas encore de verification automatique de l'espace libre.
+
+Cette alpha reste incomplete : formats ZIP avances, autres codecs d'export, remux sans
+reencodage, installateur/association M4B, mises a jour signees et MCP d'ecriture
+restent a implementer. Interface FR/EN encore partielle.
+Les binaires ne sont pas signes. Ne pas desactiver globalement la securite Windows.
+
+Sources de l'application : source/ (GNU GPL v3 ou ulterieure).
+Sources du moteur FFmpeg 8.0.1 et zlib 1.3.1 : archive media-sources.zip fournie
+a cote du ZIP applicatif (inutile pour executer l'application). FFmpeg est LGPL
+v2.1 ou ulterieure ; zlib est lie statiquement avec sa licence permissive.
+Licences et configuration exacte : source/third-party/ffmpeg/.
+La recette de compilation est source/scripts/build-ffmpeg-windows.sh.
+Voir README.md et VALIDATION.md pour les limites et les verifications actuelles.
+
+EN
+--
+Extract ALL ZIP files into one folder, then run m4b-Craft.exe or the launcher.
+AUDIO: FFmpeg/ffprobe are bundled beside the app for playback/export.
+RAR/7Z requires optional 7z.exe or 7zz.exe and its required runtime components
+beside the app or on PATH. No archiver is bundled or downloaded.
+Stored/Deflate ZIP needs no external archiver. Encrypted archives are refused.
+Real 7Z tested on Linux; RAR and native Windows archiver runtime unverified.
+No PATH change, external player or first-launch download is required.
+Windows 11 x86-64, a graphics driver supporting OpenGL 3.3 and a working
+Windows audio output are required.
+
+PRE-LISTENING: use Play on a track or chapter. The preview panel offers
+pause/resume/stop, volume and seeking, with sample-based elapsed position.
+Audio is streamed with bounded memory. Open exported M4B files to listen
+with the same controls. Export stops playback. Automatic track transitions
+and encoded comparison samples are not included yet.
+
+Save before opening another project; track reordering resets custom chapters.
+Export creates a new file on local NTFS and never overwrites an existing file.
+Temporary PCM storage needs about 11.5 MB per source minute plus output.
+Binaries are unsigned; do not globally disable Windows security.
+Complete application, FFmpeg and zlib sources/licenses accompany this build.
