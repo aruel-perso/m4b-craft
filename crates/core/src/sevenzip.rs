@@ -31,7 +31,7 @@ fn discover_in(dirs: impl IntoIterator<Item = PathBuf>) -> Result<PathBuf> {
             }
         }
     }
-    bail!("RAR/7Z import requires optional 7z or 7zz. Place the archiver beside the application or on PATH; no archiver is bundled.")
+    bail!("RAR/7Z import requires 7z or 7zz. Repair the installation or place the archiver beside the application or on PATH.")
 }
 fn command(exe: &Path, action: &str, source: &Path) -> Command {
     let mut c = crate::command(exe);
@@ -59,6 +59,15 @@ fn listing(text: &str) -> Result<Vec<Member>> {
     listing_password(text, false)
 }
 fn listing_password(text: &str, password: bool) -> Result<Vec<Member>> {
+    // Official 7-Zip's Unix prompt differs from its Windows console prompt.
+    // Strip only a known leading prompt, and only when we supplied a password.
+    let text = if password {
+        text.strip_prefix("\nEnter password (will not be echoed):\n")
+            .or_else(|| text.strip_prefix("\nEnter password:\n"))
+            .unwrap_or(text)
+    } else {
+        text
+    };
     let mut members = Vec::new();
     let mut seen = HashSet::new();
     let mut total = 0u64;
@@ -197,10 +206,7 @@ fn extract_with_options(
     let bytes = fs::read(&listing_file)?;
     fs::remove_file(&listing_file)?;
     let text = String::from_utf8(bytes)?.replace("\r\n", "\n");
-    let text = text
-        .strip_prefix("\nEnter password (will not be echoed):\n")
-        .unwrap_or(&text);
-    let members = listing_password(text, password.is_some())?;
+    let members = listing_password(&text, password.is_some())?;
     *count = count
         .checked_add(members.len())
         .context("Entry count overflow")?;
@@ -273,6 +279,25 @@ mod tests {
         drop(stage);
         assert!(!stage_path.exists());
     }
+    #[test]
+    fn official_password_prompts_are_platform_specific_and_strict() {
+        let entry = "Path = a.wav\nSize = 5\nEncrypted = +\n";
+        for prompt in [
+            "\nEnter password:\n",
+            "\nEnter password (will not be echoed):\n",
+        ] {
+            let text = format!("{prompt}{entry}");
+            assert_eq!(listing_password(&text, true).unwrap().len(), 1);
+            assert!(listing_password(&text, false).is_err());
+        }
+        assert!(listing_password(&format!("Unknown prompt\n{entry}"), true).is_err());
+        assert!(listing_password(
+            "\nEnter password:\nPath = ../a.wav\nSize = 5\nEncrypted = +\n",
+            true
+        )
+        .is_err());
+    }
+
     #[test]
     fn hostile_listings() {
         for name in [

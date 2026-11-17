@@ -316,7 +316,7 @@ fn safe_extension(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
-/// Content baseline for a project loaded or saved under its stable sibling lock.
+/// Content baseline of the exact project bytes loaded or saved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectBaseline([u8; 32]);
 fn project_digest(bytes: &[u8]) -> ProjectBaseline {
@@ -342,7 +342,8 @@ impl Project {
     pub fn load_with_baseline(path: &Path) -> Result<(Self, ProjectBaseline)> {
         let canonical = dunce::canonicalize(path)?;
         let path = canonical.as_path();
-        let _lock = project_lock(path)?;
+        // Atomic project publication gives readers a complete snapshot. Only
+        // writers need the sidecar lock; opening a read-only project must work.
         let bytes = fs::read(path)?;
         Ok((Self::load_bytes(path, &bytes)?, project_digest(&bytes)))
     }
@@ -372,6 +373,20 @@ impl Project {
 #[cfg(test)]
 mod conflict_tests {
     use super::*;
+    #[test]
+    fn loading_snapshot_does_not_require_a_writable_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.m4bproj");
+        Project::default().save(&path).unwrap();
+        // A directory occupying the sidecar name also prevents its creation
+        // when tests run as root, where chmod alone cannot prove read-only use.
+        fs::create_dir(dir.path().join(".book.m4bproj.m4b-lock")).unwrap();
+        let original = fs::read(&path).unwrap();
+        let (project, baseline) = Project::load_with_baseline(&path).unwrap();
+        assert!(project.save_with_baseline(&path, Some(&baseline)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
     #[test]
     fn concurrent_saves_accept_only_one_writer() {
         let dir = tempfile::tempdir().unwrap();

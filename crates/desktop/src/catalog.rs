@@ -169,6 +169,10 @@ pub const CATALOG: &[(&str, &str)] = &[
         "Pistes (chapitres personnalisés conservés)",
     ),
     ("Unsaved project", "Projet modifié"),
+    (
+        "Project changed on disk; use Save As or reload to preserve the newer version.",
+        "Le projet a changé sur le disque ; utilisez Enregistrer sous ou rechargez-le pour préserver la version la plus récente.",
+    ),
     ("Update", "Mettre à jour"),
     ("Update available", "Mise à jour disponible"),
     ("Validation", "Validation"),
@@ -239,6 +243,8 @@ pub fn error(fr: bool, diagnostic: &str) -> &'static str {
         "Review chapter positions before changing tracks or exporting."
     } else if lower.contains("stream") {
         "Cannot select this audio stream; inspect the available streams."
+    } else if lower.contains("project changed") {
+        "Project changed on disk; use Save As or reload to preserve the newer version."
     } else if lower.contains("exists")
         || lower.contains("overwrite")
         || lower.contains("no-overwrite")
@@ -299,6 +305,10 @@ mod tests {
         assert_eq!(
             message(false, "Encoding MP3 and chapters"),
             "Encoding MP3 and chapters"
+        );
+        assert_eq!(
+            error(true, "Project changed since it was loaded; use Save As or reload"),
+            "Le projet a changé sur le disque ; utilisez Enregistrer sous ou rechargez-le pour préserver la version la plus récente."
         );
         assert_eq!(
             error(true, "No space left on device"),
