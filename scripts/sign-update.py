@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--legacy', action='store_true', help='Sign old-slug, old-name compatibility channel')
     p.add_argument('--key', type=Path, required=True)
     installers = p.add_mutually_exclusive_group(required=True)
     installers.add_argument('--installer', type=Path)
@@ -30,7 +31,12 @@ def main():
     if a.msi and a.platform != 'windows-x86_64': p.error('--msi requires windows-x86_64')
     a.installer = a.installer or a.msi
     extension = 'msi' if a.platform == 'windows-x86_64' else 'dmg'
-    expected = f'm4b-Craft-{a.version}-{a.platform}.{extension}'
+    prefix_name = 'm4b-Craft' if a.legacy else 'M4B-Editor'
+    repository = 'm4b-craft' if a.legacy else 'm4b-editor'
+    expected = f'{prefix_name}-{a.version}-{a.platform}.{extension}'
+    manifest_name = f'update-{a.platform}.json' if a.legacy else f'update-v2-{a.platform}.json'
+    if a.out.name != manifest_name: p.error(f'Expected manifest filename {manifest_name}')
+    if a.installer.is_symlink(): p.error('Symlinked installer')
     if a.installer.name != expected: p.error(f'Expected filename {expected}')
     if not 0 < a.installer.stat().st_size <= 512*1024*1024: p.error('Invalid installer size')
     public_der = subprocess.check_output(['openssl','pkey','-in',str(a.key),'-pubout','-outform','DER'])
@@ -40,7 +46,7 @@ def main():
     if public_der != prefix + expected_key: p.error('PEM does not match pinned public key')
     payload = json.dumps(dict(version=a.version, platform=a.platform,filename=expected,
         sha256=hashlib.sha256(a.installer.read_bytes()).hexdigest(),size=a.installer.stat().st_size,
-        url=f'https://github.com/aruel-perso/m4b-craft/releases/download/v{a.version}/{expected}'),
+        url=f'https://github.com/aruel-perso/{repository}/releases/download/v{a.version}/{expected}'),
         separators=(',',':'),sort_keys=True)
     a.scratch.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='m4b-sign-',dir=a.scratch) as temporary:

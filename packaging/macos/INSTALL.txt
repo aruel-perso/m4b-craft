@@ -1,11 +1,13 @@
-m4b-Craft — AppleSilicon ARM64 only
-Drag m4b-Craft.app to Applications, then eject this disk image.
-The bundle contains the GUI, m4b-cli, ffmpeg and ffprobe in Contents/MacOS.
+M4B Editor — AppleSilicon ARM64 only
+Drag M4B Editor.app to Applications, then eject this disk image.
+The bundle contains the GUI, m4b-editor-cli, ffmpeg, ffprobe and native ARM64 7zz in Contents/MacOS.
 No Homebrew runtime installation is required.
-This alpha has ad-hoc code signatures only: no Developer ID or notarization.
+This release has ad-hoc code signatures only: no Developer ID or notarization.
 Gatekeeper can block downloaded builds. Only open a build whose origin you trust;
 use macOS Privacy & Security / Open Anyway if appropriate for your policy.
 Keep projects/assets outside the application bundle. Copy the entire project
 folder (including assets) when transporting a project. Export M4B for players.
 Corresponding media source is in the accompanying -media-sources.zip;
 application source, build configuration and licenses are in Contents/Resources.
+
+The optional legacy image contains m4b-Craft.app for the 0.3 update helper.

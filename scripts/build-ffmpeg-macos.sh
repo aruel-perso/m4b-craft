@@ -10,6 +10,9 @@ source_archive="$(cd "$(dirname "$source_archive")" && pwd)/$(basename "$source_
 zlib_archive="$(cd "$(dirname "$zlib_archive")" && pwd)/$(basename "$zlib_archive")"
 printf '%s  %s\n' 05ee0b03119b45c0bdb4df654b96802e909e0a752f72e4fe3794f487229e5a41 "$source_archive" | shasum -a 256 -c -
 printf '%s  %s\n' 9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23 "$zlib_archive" | shasum -a 256 -c -
+lame_archive="${3:?Pass pinned lame-3.100.tar.gz}"
+lame_archive="$(cd "$(dirname "$lame_archive")" && pwd)/$(basename "$lame_archive")"
+printf '%s  %s\n' ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e "$lame_archive" | shasum -a 256 -c -
 out="$root/vendor/macos-media"
 mkdir -p "$out" "${TMPDIR:?Set TMPDIR to writable scratch}"
 build="$(mktemp -d "$TMPDIR/m4b-media.XXXXXX")"
@@ -27,6 +30,14 @@ cp zconf.h Makefile "$out/"
 # Record zlib's generated configuration; avoid retaining intermediate libraries.
 cat zconf.h Makefile > "$out/zlib-config.txt"
 rm "$out/zconf.h" "$out/Makefile"
+tar -xf "$lame_archive" -C "$build"
+cd "$build/lame-3.100"
+./configure --disable-shared --enable-static --disable-frontend --prefix="$build/static"
+make -j1
+make install
+cp COPYING "$out/COPYING.LAME"
+cp config.log "$out/lame-config.txt"
+cp "$lame_archive" "$out/lame-3.100.tar.gz"
 cd "$build/ffmpeg-8.0.1"
 ./configure --pkg-config=/usr/bin/false --prefix="$out" --cc=/usr/bin/clang --arch=aarch64 --target-os=darwin \
   --disable-autodetect --disable-x86asm "${FFMPEG_OPTIONS[@]}" \
@@ -37,5 +48,7 @@ cp ffmpeg ffprobe config.h config_components.h ffbuild/config.mak COPYING.LGPLv2
 cp "$build/zlib-1.3.1/LICENSE" "$out/LICENSE.zlib"
 cp "$source_archive" "$out/ffmpeg-8.0.1.tar.xz"
 cp "$zlib_archive" "$out/zlib-1.3.1.tar.gz"
-(cd "$out" && shasum -a 256 ffmpeg ffprobe ffmpeg-8.0.1.tar.xz zlib-1.3.1.tar.gz config.h config_components.h config.mak COPYING.LGPLv2.1 LICENSE.md LICENSE.zlib zlib-config.txt > SHA256SUMS)
+(cd "$out" && shasum -a 256 ffmpeg ffprobe ffmpeg-8.0.1.tar.xz zlib-1.3.1.tar.gz config.h config_components.h config.mak COPYING.LGPLv2.1 LICENSE.md LICENSE.zlib zlib-config.txt lame-3.100.tar.gz COPYING.LAME lame-config.txt > SHA256SUMS)
 python3 "$root/scripts/verify-macos.py" "$out/ffmpeg" "$out/ffprobe"
+
+python3 "$root/scripts/bundle-archiver.py" --archives "$(dirname "$source_archive")" --media "$out" --platform macos-aarch64

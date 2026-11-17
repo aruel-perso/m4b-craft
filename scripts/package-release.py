@@ -16,10 +16,10 @@ import zipfile
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
-from release_common import VERSION, verify_media, copy_source, copy_licenses, checksums
+from release_common import SOURCES, VERSION, verify_media, copy_source, copy_licenses, checksums, license_sidecar
 MSI_VERSION = VERSION.split('-')[0]
 UPGRADE_CODE = '790fce8b-e564-43b1-9701-d427fdd80c6c'
-NAME = f'm4b-Craft-{VERSION}-windows-x86_64'
+NAME = f'M4B-Editor-{VERSION}-windows-x86_64'
 NS = 'http://schemas.microsoft.com/wix/2006/wi'
 ET.register_namespace('', NS)
 
@@ -29,12 +29,12 @@ def node(parent, tag, **attrs):
 def wix(payload, output):
     root = ET.Element('{'+NS+'}Wix')
     product = node(root, 'Product', Id=str(uuid.uuid5(uuid.UUID(UPGRADE_CODE), VERSION)),
-                   Name='m4b-Craft', Language='1033', Version=MSI_VERSION,
-                   Manufacturer='m4b-Craft contributors', UpgradeCode=UPGRADE_CODE)
+                   Name='M4B Editor', Language='1033', Version=MSI_VERSION,
+                   Manufacturer='M4B Editor contributors', UpgradeCode=UPGRADE_CODE)
     node(product, 'Package', InstallerVersion='500', Compressed='yes', InstallScope='perUser',
-         Description='m4b-Craft audiobook editor')
+         Description='M4B Editor audiobook editor')
     node(product, 'Media', Id='1', Cabinet='application.cab', EmbedCab='yes')
-    node(product, 'MajorUpgrade', DowngradeErrorMessage='A newer m4b-Craft is already installed.')
+    node(product, 'MajorUpgrade', DowngradeErrorMessage='A newer M4B Editor is already installed.')
     sequence = node(product, 'InstallExecuteSequence')
     node(sequence, 'RemoveExistingProducts', After='InstallInitialize')
     directory = node(product, 'Directory', Id='TARGETDIR', Name='SourceDir')
@@ -42,14 +42,21 @@ def wix(payload, output):
     programs = node(local, 'Directory', Id='Programs', Name='Programs')
     install = node(programs, 'Directory', Id='INSTALLDIR', Name='m4b-Craft')
     menu = node(directory, 'Directory', Id='ProgramMenuFolder')
-    menu_dir = node(menu, 'Directory', Id='ApplicationProgramsFolder', Name='m4b-Craft')
-    feature = node(product, 'Feature', Id='Complete', Title='m4b-Craft', Level='1')
+    menu_dir = node(menu, 'Directory', Id='ApplicationProgramsFolder', Name='M4B Editor')
+    legacy_menu = node(menu, 'Directory', Id='LegacyApplicationProgramsFolder', Name='m4b-Craft')
+    feature = node(product, 'Feature', Id='Complete', Title='M4B Editor', Level='1')
     menu_component = node(menu_dir, 'Component', Id='UserRegistration',
-        Guid=str(uuid.uuid5(uuid.UUID(UPGRADE_CODE), 'user-registration')), Win64='yes')
-    node(menu_component, 'RegistryValue', Root='HKCU', Key='Software\\m4b-Craft',
+        Guid=str(uuid.uuid5(uuid.UUID(UPGRADE_CODE), 'editor-user-registration')), Win64='yes')
+    node(menu_component, 'RegistryValue', Root='HKCU', Key='Software\\M4B-Editor',
         Name='Installed', Type='integer', Value='1', KeyPath='yes')
     node(menu_component, 'RemoveFolder', Id='RemoveStartMenu', On='uninstall')
     node(feature, 'ComponentRef', Id='UserRegistration')
+    legacy_registration = node(legacy_menu, 'Component', Id='LegacyUserRegistration',
+        Guid=str(uuid.uuid5(uuid.UUID(UPGRADE_CODE), 'user-registration')), Win64='yes')
+    node(legacy_registration, 'RegistryValue', Root='HKCU', Key='Software\\m4b-Craft',
+        Name='Installed', Type='integer', Value='1', KeyPath='yes')
+    node(legacy_registration, 'RemoveFolder', Id='RemoveLegacyStartMenu', On='uninstall')
+    node(feature, 'ComponentRef', Id='LegacyUserRegistration')
     directories = {Path('.'): install}
     for index, file in enumerate(sorted(payload.rglob('*'))):
         if not file.is_file():
@@ -66,8 +73,11 @@ def wix(payload, output):
         component = node(directories[relative.parent], 'Component', Id=component_id,
                          Guid=str(uuid.uuid5(uuid.UUID(UPGRADE_CODE), relative.as_posix())), Win64='yes')
         installed = node(component, 'File', Id=f'F{index}', Source=str(file), Name=file.name, KeyPath='yes')
-        if relative.as_posix() == 'm4b-Craft.exe':
+        if relative.as_posix() == 'm4b-editor.exe':
             node(installed, 'Shortcut', Id='StartMenuShortcut', Directory='ApplicationProgramsFolder',
+                 Name='M4B Editor', WorkingDirectory='INSTALLDIR', Advertise='yes')
+        if relative.as_posix() == 'm4b-Craft.exe':
+            node(installed, 'Shortcut', Id='LegacyStartMenuShortcut', Directory='LegacyApplicationProgramsFolder',
                  Name='m4b-Craft', WorkingDirectory='INSTALLDIR', Advertise='yes')
         node(feature, 'ComponentRef', Id=component_id)
     ET.indent(root)
@@ -104,42 +114,45 @@ def main():
     binaries = ROOT/'target/x86_64-pc-windows-gnu/release'
     # Always build first. A failed build must not silently package stale alpha executables.
     subprocess.run(['cargo','build','--locked','--release','--target','x86_64-pc-windows-gnu',
-                    '-p','m4b-desktop','-p','m4b-cli'], cwd=ROOT, check=True)
+                    '-p','m4b-editor-desktop','-p','m4b-editor-cli'], cwd=ROOT, check=True)
     args.out.mkdir(parents=True, exist_ok=True)
     output = args.out.resolve()
     args.scratch.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='m4b-release-', dir=args.scratch) as temporary:
         payload = Path(temporary)/'payload'
         payload.mkdir()
-        for source, target in [('m4b-desktop.exe','m4b-Craft.exe'),('m4b-cli.exe','m4b-cli.exe')]:
+        for source, target in [('m4b-editor.exe','m4b-editor.exe'),('m4b-editor-cli.exe','m4b-editor-cli.exe')]:
             shutil.copy2(binaries/source, payload/target)
+        # Exact old updater relaunch path, same bytes as canonical binary.
+        shutil.copy2(payload/'m4b-editor.exe', payload/'m4b-Craft.exe')
         media = ROOT/'vendor/windows-media'
         verify_media(media, 'windows-x86_64')
-        for name in ['ffmpeg.exe','ffprobe.exe']:
+        for name in ['ffmpeg.exe','ffprobe.exe','7z.exe','7z.dll']:
             shutil.copy2(media/name, payload/name)
-        for executable in payload.glob('*.exe'): verify_pe(executable)
+        for executable in list(payload.glob('*.exe')) + list(payload.glob('*.dll')): verify_pe(executable)
         shutil.copy2(ROOT/'LICENSE', payload/'LICENSE')
-        for name in ['Lancer-m4b-Craft.cmd','LISEZ-MOI-WINDOWS.txt']:
+        for name in ['Lancer-M4B-Editor.cmd','LISEZ-MOI-WINDOWS.txt']:
             shutil.copy2(ROOT/'packaging/windows'/name, payload/name)
         source = payload/'source'
         copy_source(source)
         third = source/'third-party/ffmpeg'
         third.mkdir(parents=True)
         for file in media.iterdir():
-            if file.is_file() and file.suffix != '.exe' and not file.name.endswith(('.tar.xz','.tar.gz')):
+            if file.is_file() and file.name not in set(SOURCES)|{'ffmpeg.exe','ffprobe.exe','7z.exe','7z.dll'} and not file.name.endswith(('.tar.xz','.tar.gz')):
                 shutil.copy2(file, third/file.name)
         # Upstream source sidecar ships alongside MSI; do not omit it from releases.
         upstream = Path(temporary)/'media-source'
         upstream.mkdir()
-        for name in ['ffmpeg-8.0.1.tar.xz','zlib-1.3.1.tar.gz']:
+        for name in SOURCES:
             shutil.copy2(media/name, upstream/name)
         archive(upstream, output/f'{NAME}-media-sources.zip')
-        (payload/'MEDIA-SOURCES.txt').write_text(f'Corresponding FFmpeg/zlib source: {NAME}-media-sources.zip, supplied alongside this MSI. Build recipe and configuration: source/.\n')
+        (payload/'MEDIA-SOURCES.txt').write_text(f'Corresponding FFmpeg/zlib/LAME/7-Zip source and official archives: {NAME}-media-sources.zip, supplied alongside this MSI. Build recipe and configuration: source/.\n')
         copy_licenses(payload)
+        license_sidecar(payload,media,output/f'{NAME}-licenses.zip')
         retained = output/'payload'
         if retained.exists(): shutil.rmtree(retained)
         shutil.copytree(payload, retained)
-        wxs = output/'m4b-Craft.wxs'
+        wxs = output/'M4B-Editor.wxs'
         wix(retained,wxs)
         subprocess.run([args.wixl,'-a','x64','-o',str(output/f'{NAME}.msi'),str(wxs)], check=True)
         archive(payload,output/f'{NAME}.zip')

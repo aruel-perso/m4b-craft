@@ -15,15 +15,37 @@ def valid_version(version):
 if not valid_version(VERSION):
     raise ValueError('Noncanonical workspace version')
 SOURCES = {
+    'lame-3.100.tar.gz': 'ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e',
     'ffmpeg-8.0.1.tar.xz': '05ee0b03119b45c0bdb4df654b96802e909e0a752f72e4fe3794f487229e5a41',
     'zlib-1.3.1.tar.gz': '9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23',
 }
+ARCHIVER_SOURCES = {
+    '7z2606-x64.exe': '9b697f65ecc2d9b0152f5ee96d72dde522a7827690349d9307935dacf40f42ec',
+    '7z2606-mac.tar.xz': 'b6f17920b4240940461dac8ef4009891881ac44d2a5ead625ede2ec8472185dd',
+    '7z2606-src.tar.xz': 'a4e374c8f864f51df48c2cfd0e1413ec3b2ea030deae852d6a655402ebb61ac4',
+}
+SOURCES.update(ARCHIVER_SOURCES)
+ARCHIVER_MEMBERS = {
+    'windows-x86_64': {
+        '7z.exe': 'dc0493429fe28136fcb177a0e77c9875cbb3b0bff5f2f8eeba4df302e98cef76',
+        '7z.dll': '500db9eb17f3c21b729ba41dd02ecfe1823da05028c7e4ba129084cc74cc364e',
+        'LICENSE.7zip': '519ac0a4bded9c18ea02e0afb71f663d8c47373bd9facd3ac96a79f51d77765d',
+        'README.7zip': 'de4a45e9dcdabfd21e5e0e31e29079998f216db15079217b6160e92b1c151e40',
+    },
+    'macos-aarch64': {
+        '7zz': '56cf8eb2fdc6f9c0ac5d7a3cd238505814ac8ed6b88a7c64a7e3256036252c60',
+        'LICENSE.7zip': '1790374e5352329cedb46ee3808930a88e9ca2f08b82b10fcf5cf605d2c301b1',
+        'README.7zip': '79aa0fedbfb43f32d60858c8f13f42afc025adf19bf3e7ed66a7c55f451eae45',
+    },
+}
+def archiver_files(platform):
+    return {'7z.exe','7z.dll'} if platform == 'windows-x86_64' else {'7zz'}
 def sha256(path):
     with Path(path).open('rb') as file:
         return hashlib.file_digest(file, 'sha256').hexdigest()
 def verify_media(media, platform):
     executables = ['ffmpeg.exe','ffprobe.exe'] if platform == 'windows-x86_64' else ['ffmpeg','ffprobe']
-    expected = set(executables) | set(SOURCES) | {'config.h','config_components.h','config.mak','COPYING.LGPLv2.1','LICENSE.md','LICENSE.zlib','zlib-config.txt'}
+    expected = archiver_files(platform) | {'LICENSE.7zip','README.7zip'} | set(executables) | set(SOURCES) | {'config.h','config_components.h','config.mak','COPYING.LGPLv2.1','LICENSE.md','LICENSE.zlib','zlib-config.txt','COPYING.LAME','lame-config.txt'}
     if {p.name for p in media.iterdir()} != expected | {'SHA256SUMS'}:
         raise ValueError('Unexpected files in media cache')
     if (media/'SHA256SUMS').is_symlink():
@@ -40,17 +62,18 @@ def verify_media(media, platform):
     for name, digest in records.items():
         if (media/name).is_symlink() or sha256(media/name) != digest:
             raise ValueError(f'Media checksum mismatch: {name}')
-    for name, digest in SOURCES.items():
+    for name, digest in (SOURCES | ARCHIVER_MEMBERS[platform]).items():
         if records[name] != digest:
             raise ValueError(f'Unpinned source: {name}')
 def copy_source(destination):
     destination.mkdir(parents=True, exist_ok=True)
-    for name in ['crates','.cargo','.github','scripts','packaging']:
+    for name in ['crates','.cargo','.github','scripts','packaging','docs','tests']:
+        if name == 'tests' and not (ROOT/name).exists(): continue
         for entry in (ROOT/name).rglob('*'):
             if entry.is_symlink() or entry.suffix.lower() in ('.pem','.key'):
                 raise ValueError(f'Refusing private key or symlink: {entry}')
         shutil.copytree(ROOT/name, destination/name, ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
-    for name in ['Cargo.toml','Cargo.lock','.gitignore','.gitattributes','LICENSE','README.md','README.en.md','BRIEF.md','ROADMAP.md','VALIDATION.md','RELEASE.md']:
+    for name in ['Cargo.toml','Cargo.lock','.gitignore','.gitattributes','LICENSE','README.md','README.en.md','RELEASE.md']:
         shutil.copy2(ROOT/name, destination/name)
 def copy_licenses(destination):
     import json
@@ -69,6 +92,19 @@ def copy_licenses(destination):
                 dest.parent.mkdir(parents=True,exist_ok=True)
                 shutil.copy2(file,dest)
     (destination/'THIRD-PARTY-NOTICES.txt').write_text('\n'.join(sorted(notices))+'\n',encoding='utf-8')
+def license_sidecar(payload, media, output):
+    """Standalone redistributable license notices; also retained inside installers."""
+    import zipfile
+    files = [(payload/'LICENSE', 'LICENSE'),
+             (payload/'THIRD-PARTY-NOTICES.txt', 'THIRD-PARTY-NOTICES.txt')]
+    files += [(p, p.relative_to(payload).as_posix()) for p in sorted((payload/'licenses').rglob('*')) if p.is_file()]
+    files += [(media/name, 'media/'+name) for name in
+              ['COPYING.LGPLv2.1','LICENSE.md','LICENSE.zlib','COPYING.LAME','LICENSE.7zip','README.7zip']]
+    with zipfile.ZipFile(output,'w',zipfile.ZIP_DEFLATED,strict_timestamps=False) as archive:
+        for file, name in files:
+            if file.is_symlink(): raise ValueError(f'Symlinked license: {file}')
+            archive.write(file,name)
+
 def checksums(output):
     for file in sorted(output.iterdir()):
         if file.suffix in ('.msi','.dmg','.zip'):

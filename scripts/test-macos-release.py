@@ -20,6 +20,7 @@ def run(*args, **kwargs):
     return subprocess.run([str(a) for a in args],check=True,**kwargs)
 def main():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--legacy',action='store_true')
     p.add_argument('--dmg',required=True,type=Path); p.add_argument('--scratch',required=True,type=Path)
     a = p.parse_args()
     assert os.uname().machine == 'arm64' and os.uname().sysname == 'Darwin'
@@ -35,9 +36,9 @@ def main():
         try:
             assert (mount/'Applications').is_symlink()
             assert os.readlink(mount/'Applications') == '/Applications'
-            source = mount/'m4b-Craft.app'
+            source = mount/('m4b-Craft.app' if a.legacy else 'M4B Editor.app')
             info = plistlib.loads((source/'Contents/Info.plist').read_bytes())
-            assert info['CFBundleExecutable'] == 'm4b-Craft'
+            assert info['CFBundleExecutable'] == ('m4b-Craft' if a.legacy else 'm4b-editor')
             assert info['CFBundleShortVersionString'] == VERSION.split('-')[0]
             assert info['UTExportedTypeDeclarations'][0]['UTTypeTagSpecification']['public.filename-extension'] == ['m4bproj']
             resources = source/'Contents/Resources'
@@ -52,16 +53,23 @@ def main():
             assert not any(f.suffix.lower() in ('.pem','.key') for f in source.rglob('*'))
             run('codesign','--verify','--deep','--strict',source)
             install = work/'Writable Applications'; install.mkdir()
-            installed = install/'m4b-Craft.app'
+            installed = install/source.name
             run('ditto',source,installed)
         finally:
             run('hdiutil','detach',mount)
         run('codesign','--verify','--deep','--strict',installed)
         binaries = installed/'Contents/MacOS'
-        for name in ['m4b-Craft','m4b-cli','ffmpeg','ffprobe']: verify.verify(binaries/name)
+        for name in ['m4b-editor','m4b-editor-cli','ffmpeg','ffprobe','7zz']: verify.verify(binaries/name)
+        fixture = install/'archive test.zip'
+        with zipfile.ZipFile(fixture,'w') as archive:
+            archive.writestr('synthetic.txt',b'offline bundled archiver fixture')
+        unpacked = install/'archive output'
+        run(binaries/'7zz','x','-y','-o'+str(unpacked),fixture)
+        assert (unpacked/'synthetic.txt').read_bytes() == b'offline bundled archiver fixture'
+
         # A system-only PATH proves installed CLI finds its adjacent media tools.
         env = dict(os.environ,PATH='/usr/bin:/bin:/usr/sbin:/sbin')
-        cli = binaries/'m4b-cli'
+        cli = binaries/'m4b-editor-cli'
         version = subprocess.check_output([str(cli),'--version'],text=True,env=env)
         assert VERSION in version
         track = work/'PCM é sample.wav'
@@ -70,6 +78,12 @@ def main():
             output.writeframes(b''.join(struct.pack('<h', 8000 if (i//50)%2 else -8000) for i in range(44100)))
         project = work/'book.m4bproj'; book = work/'book.m4b'
         run(cli,'new','--project',project,'--title','Installed CLI smoke',track,env=env)
+        for codec, extension in [('libmp3lame','mp3'),('flac','flac')]:
+            encoded = work/f'codec-smoke.{extension}'
+            run(binaries/'ffmpeg','-v','error','-nostdin','-i',track,'-c:a',codec,encoded,env=env)
+            run(binaries/'ffmpeg','-v','error','-nostdin','-i',encoded,'-f','null','-',env=env)
+            data = json.loads(subprocess.check_output([str(binaries/'ffprobe'),'-v','error','-show_streams','-of','json',str(encoded)],env=env))
+            assert data['streams'][0]['codec_name'] == extension
         run(cli,'check',project,env=env)
         run(cli,'export',project,book,env=env)
         run(cli,'probe',book,env=env)

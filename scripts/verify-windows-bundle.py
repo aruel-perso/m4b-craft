@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Execute Windows bundle end-to-end under Wine, without installing media tools.
-Usage: python scripts/verify-windows-bundle.py dist/m4b-Craft-...zip
+Usage: python scripts/verify-windows-bundle.py dist/M4B-Editor-...zip
 Wine is a developer-only test requirement, not an end-user dependency.
 """
 import argparse
@@ -15,7 +15,7 @@ import tempfile
 import wave
 import zipfile
 import zlib
-from release_common import VERSION
+from release_common import VERSION, SOURCES
 
 
 def main():
@@ -33,12 +33,12 @@ def main():
             assert archive.testzip() is None
             archive.extractall(temp / 'extracted')
         package = temp/'extracted'
-        if not (package/'m4b-cli.exe').is_file():
+        if not (package/'m4b-editor-cli.exe').is_file():
             package = next(package.iterdir())
         cwd = temp / 'unrelated directory été'
         cwd.mkdir()
         # Poison CWD: runtime must locate its packaged tools by executable directory.
-        for name in ['ffmpeg.exe', 'ffprobe.exe']:
+        for name in ['ffmpeg.exe', 'ffprobe.exe', '7z.exe', '7z.dll']:
             (cwd / name).write_bytes(b'not an executable')
         def win(path):
             return 'Z:' + str(path.resolve()).replace('/', '\\')
@@ -51,7 +51,7 @@ def main():
             if not ok:
                 assert result.returncode != 0
             return result
-        cli = package / 'm4b-cli.exe'
+        cli = package / 'm4b-editor-cli.exe'
         assert VERSION in run(cli, '--version').stdout
         assert 'aac' in run(cli, 'encoders').stdout.splitlines()
         tracks = []
@@ -61,6 +61,12 @@ def main():
                 wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(rate)
                 wav.writeframes(b''.join(struct.pack('<h', int(10000 * math.sin(2 * math.pi * frequency * i / rate))) for i in range(rate)))
             tracks.append(path)
+        for codec, extension in [('libmp3lame','mp3'),('flac','flac')]:
+            encoded = cwd/f'codec-smoke.{extension}'
+            run(package/'ffmpeg.exe','-v','error','-nostdin','-i',win(tracks[0]),'-c:a',codec,win(encoded))
+            run(package/'ffmpeg.exe','-v','error','-nostdin','-i',win(encoded),'-f','null','-')
+            data = json.loads(run(package/'ffprobe.exe','-v','error','-show_streams','-of','json',win(encoded)).stdout)
+            assert data['streams'][0]['codec_name'] == extension
         def png_chunk(kind, data):
             return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
         cover = cwd / 'couverture.png'
@@ -83,12 +89,18 @@ def main():
         assert len(pcm.stdout) > 96000 and any(pcm.stdout)
         print('PASS bundled Windows tools: natural-order WAV import -> AAC M4B + PNG cover + chapters -> probe -> non-silent preview PCM at seek position')
         print('PASS unrelated Unicode CWD with poisoned FFmpeg names; no WINEPATH media tools; originals and existing output preserved')
+        fixture = temp/'archive test.zip'
+        with zipfile.ZipFile(fixture,'w') as archive:
+            archive.writestr('synthetic.txt',b'offline bundled archiver fixture')
+        unpacked = temp/'archive output'
+        run(package/'7z.exe','x','-y','-o'+win(unpacked),win(fixture))
+        assert (unpacked/'synthetic.txt').read_bytes() == b'offline bundled archiver fixture'
         # Actual application binary sources and media sources must be included.
         assert (package / 'source/crates/desktop/src/playback.rs').is_file()
         sources_path = args.archive.with_name(args.archive.stem + '-media-sources.zip')
         with zipfile.ZipFile(sources_path) as upstream:
             assert upstream.testzip() is None
-            for name in ['ffmpeg-8.0.1.tar.xz', 'zlib-1.3.1.tar.gz']:
+            for name in SOURCES:
                 assert any(path == name or path.endswith('/' + name) for path in upstream.namelist()), name
         print('PASS corresponding application source and accompanying bundled media source present')
     subprocess.run(['/usr/lib/wine/wineserver64', '-k'], env=env, timeout=20, check=False)
