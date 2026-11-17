@@ -15,7 +15,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 Use `CARGO_BUILD_JOBS=1` on constrained hosts. One owner builds Rust/media at a
 time. Packaging scripts build fresh binaries and fail on a failed build.
-Do not package stale executables. See [testing](testing.md) and [release](../RELEASE.md).
+Do not package stale executables. See [testing](testing.md) and [release](release.md).
 
 ## Media backend
 

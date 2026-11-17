@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run cross-built Rust tests under Wine with the bundled Windows media tools."""
+"""Run actual Windows Rust tests with the bundled media/archiver and staged fixtures."""
 import argparse
 import json
 import os
@@ -8,28 +8,42 @@ import shutil
 import subprocess
 import tempfile
 
-parser = argparse.ArgumentParser()
+parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('cargo_json', type=Path)
+parser.add_argument('--media', type=Path)
+parser.add_argument('--fixtures', type=Path)
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[1]
-media = root / 'vendor/windows-media'
-scratch = Path(os.environ.get('TMPDIR', str(Path.home() / '.hermes/cache/scratch')))
-env = dict(os.environ, WINEDEBUG='-all', WINEPREFIX=str(scratch / 'm4b-bundle-verification-wine'))
+media = (args.media or root/'vendor/windows-media').resolve()
+fixtures = (args.fixtures or root/'tests/fixtures').resolve()
+scratch = Path(os.environ.get('TMPDIR', str(Path.home()/'.hermes/cache/scratch')))
+scratch.mkdir(parents=True, exist_ok=True)
 executables = []
 for line in args.cargo_json.read_text().splitlines():
     message = json.loads(line)
     if message.get('reason') == 'compiler-artifact' and message.get('profile', {}).get('test') and message.get('executable'):
-        executables.append(Path(message['executable']))
+        executable = Path(message['executable']).resolve()
+        if executable not in executables: executables.append(executable)
 assert executables, 'No test artifacts found'
-with tempfile.TemporaryDirectory(prefix='m4b-windows-tests-', dir=scratch) as temp:
-    temp = Path(temp)
-    for name in ['ffmpeg.exe', 'ffprobe.exe']:
-        shutil.copy2(media / name, temp / name)
-    env['WINEPATH'] = 'Z:' + str(temp).replace('/', '\\')
-    for executable in executables:
-        copied = temp / executable.name
-        shutil.copy2(executable, copied)
-        print('RUN Windows:', executable.name, flush=True)
-        subprocess.run(['/usr/lib/wine/wine64', str(copied), '--nocapture', '--test-threads=1'], cwd=temp, env=env, timeout=100, check=True)
-print(f'PASS {len(executables)} Windows Rust test executables using bundled FFmpeg/ffprobe under Wine')
-subprocess.run(['/usr/lib/wine/wineserver64', '-k'], env=env, timeout=20, check=False)
+wine = shutil.which('wine64') or '/usr/lib/wine/wine64'
+server = shutil.which('wineserver') or '/usr/lib/wine/wineserver64'
+with tempfile.TemporaryDirectory(prefix='m4b-editor-windows-tests-', dir=scratch) as temporary:
+    temp = Path(temporary)
+    for name in ['ffmpeg.exe','ffprobe.exe','7z.exe','7z.dll']:
+        shutil.copy2(media/name,temp/name)
+    shutil.copytree(fixtures,temp/'fixtures')
+    def windows(path): return 'Z:'+str(path).replace('/','\\')
+    runtime = temp/'runtime'; runtime.mkdir(mode=0o700)
+    env = dict(os.environ,WINEDEBUG='-all',WINEPREFIX=str(temp/'prefix'),
+               XDG_RUNTIME_DIR=str(runtime),WINEPATH=windows(temp),
+               M4B_EDITOR_TEST_FIXTURES=windows(temp/'fixtures'))
+    try:
+        for executable in executables:
+            copied = temp/executable.name
+            shutil.copy2(executable,copied)
+            print('RUN Windows:',executable.name,flush=True)
+            subprocess.run([wine,str(copied),'--nocapture','--test-threads=1'],
+                           cwd=temp,env=env,timeout=180,check=True)
+        print(f'PASS {len(executables)} Windows Rust test executables with bundled FFmpeg/ffprobe/7-Zip and staged fixtures',flush=True)
+    finally:
+        subprocess.run([server,'-k'],env=env,timeout=20,check=False)

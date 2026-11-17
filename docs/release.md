@@ -6,7 +6,7 @@ No publication or repository rename is performed by the local tooling.
 
 ## Build and review
 
-Run the checks in [docs/testing.md](docs/testing.md). Fetch pinned media sources,
+Run the checks in [testing.md](testing.md). Fetch pinned media sources,
 build platform media caches, then run `package-release.py` on the Windows GNU
 build host and `package-macos.py` on native Mac ARM64. New assets start with
 `M4B-Editor-VERSION-PLATFORM`. The app is `M4B Editor.app`, with
@@ -68,7 +68,7 @@ No live native Mac upgrade has been verified by this packaging work.
 
 Official 7-Zip 26.06 archives and extracted contents are verified locally;
 native bundled archive execution/password/offline acceptance remains required;
-see [development](docs/development.md). Hosted builds, native Windows upgrade,
+see [development](development.md). Hosted builds, native Windows upgrade,
 native Mac GUI/live replacement and real release-key signing remain necessary.
 CI publishing targets only the canonical repository; compatibility publication
 is a reviewer-controlled separate operation with its own repository permissions.

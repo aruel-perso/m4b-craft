@@ -73,7 +73,7 @@ def copy_source(destination):
             if entry.is_symlink() or entry.suffix.lower() in ('.pem','.key'):
                 raise ValueError(f'Refusing private key or symlink: {entry}')
         shutil.copytree(ROOT/name, destination/name, ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
-    for name in ['Cargo.toml','Cargo.lock','.gitignore','.gitattributes','LICENSE','README.md','README.en.md','RELEASE.md']:
+    for name in ['Cargo.toml','Cargo.lock','.gitignore','.gitattributes','LICENSE','README.md','README.en.md']:
         shutil.copy2(ROOT/name, destination/name)
 def copy_licenses(destination):
     import json

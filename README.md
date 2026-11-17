@@ -27,7 +27,7 @@ release ; le périmètre prévu n'est pas une preuve de fonctionnement.
 
 Les mises à jour exigent une signature Ed25519 et la vérification du contenu.
 La migration depuis 0.3 utilise un dépôt de compatibilité et quelques anciens
-noms techniques documentés dans [la procédure de livraison](RELEASE.md).
+noms techniques documentés dans [la procédure de livraison](docs/release.md).
 
 [Développement](docs/development.md) · [Tests](docs/testing.md) ·
 [Feuille de route](docs/roadmap.md) · [Licence GPL-3.0](LICENSE)

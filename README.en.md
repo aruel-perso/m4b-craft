@@ -24,7 +24,7 @@ proof of working behavior. Official pinned 7-Zip 26.06 is bundled for offline ar
 
 Updates require Ed25519 signatures and content verification. Migration from 0.3
 uses a compatibility repository and deliberate old technical names, explained in
-the [release procedure](RELEASE.md).
+the [release procedure](docs/release.md).
 
 [Development](docs/development.md) · [Testing](docs/testing.md) ·
 [Roadmap](docs/roadmap.md) · [GPL-3.0 license](LICENSE)

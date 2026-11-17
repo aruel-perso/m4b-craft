@@ -1,5 +1,29 @@
 # Testing
 
+## Application and fixtures
+
+```sh
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
+python3 scripts/generate-fixtures.py --check
+```
+
+The versioned synthetic corpus includes real RAR/7Z/ZIP, encrypted archives,
+ZIP64, multiple audio streams and legacy project data. Its manifest records
+provenance, expected properties and exact hashes. `--generate` rebuilds fixtures;
+`--check` only verifies their hashes and needs no archiver. Generation discovers
+`7z` or `7zz`. Runtime tests exercise portable copies, stale-save rejection,
+chapter preservation, metadata, formats, preview and bounded process cleanup.
+Large MP4 metadata is tested without loading the whole movie atom in production.
+
+For Windows Rust tests, cross-compile with `--no-run --message-format=json` and
+pass the output file to `scripts/verify-windows-tests.py`. It stages the Windows
+FFmpeg/ffprobe, 7-Zip and all fixtures into an isolated Wine prefix. The
+`M4B_EDITOR_TEST_FIXTURES` override supplies a real Windows fixture path; tests
+must not depend on the compiler host's absolute source pathname. macOS CI uses
+the native bundled `7zz` through runtime discovery.
+
 Fast release-tool tests (no Rust/media compilation or network required):
 
 ```sh
