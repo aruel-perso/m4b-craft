@@ -8,8 +8,8 @@ Create and edit M4B audiobooks locally: track import, natural ordering, chapters
 metadata, cover art, playback and AAC export. GUI, CLI and a read-only MCP server.
 No remote audio service required.
 
-**0.3.0-alpha.1 is a prerelease in preparation.** The badge reflects actual published
-releases; this repository does not establish that publication has occurred.
+**Documented version: 0.3.0-alpha.1 (prerelease).** The badge and Releases page
+show the versions actually available.
 Visit [GitHub releases, including prereleases](https://github.com/aruel-perso/m4b-craft/releases)
 and select files from the same version:
 
@@ -33,6 +33,16 @@ whose origin you trust and when permitted by your security policy.
 Historical validation includes Linux and Wine tests; the new macOS CI work remains
 **untested until an actual run succeeds**. No interactive Mac GUI test is claimed.
 See [VALIDATION.md](VALIDATION.md) and [CI runs](https://github.com/aruel-perso/m4b-craft/actions).
+
+## Interface
+
+At startup, create/open a project or choose a recent project. Its remove button
+only removes the link. First-run language follows the OS (FR/EN, English fallback);
+manual language choices persist in Settings. Drag the sidebar divider to resize it.
+The project name appears below the menus. Metadata displays the cover. The bottom
+transport provides play/pause, stop, previous/next and seeking. New projects default
+to 160 kbps AAC export; existing project settings are retained. Compatible AAC
+remux avoids re-encoding.
 
 ## Projects and transport
 
@@ -61,11 +71,12 @@ inclusion to receive alphas. Manifest signatures, download size and SHA-256 are
 verified against the embedded public key, unchanged for this release.
 
 **No installation without your explicit consent.** Save the project and stop
-playback/export before confirming. Windows opens the MSI wizard; macOS uses the DMG
-and application copying into Applications. Follow the application's instructions
-for closing and replacement. Neither the startup check nor a download alone replaces
-your application. The Rust behavior for this version must be integrated and validated
-with this pipeline before publication.
+playback/export before confirming. Clicking Update downloads and verifies the package without a browser, then hands
+off to Windows installation or macOS app replacement. System confirmations may
+still be required. Neither the startup check nor a download alone replaces
+your application. See VALIDATION.md and the matching CI run for the exact verification scope.
+
+On macOS, automatic replacement requires an installed `.app` whose parent directory is writable by your user. Use `~/Applications` (create it if needed), copy `m4b-Craft.app` there, eject the DMG, and reopen that copy. If `/Applications` is not writable, the updater reports an error; it does not request administrator elevation. This alpha has no Apple Developer ID signing or notarization.
 
 ## Development
 

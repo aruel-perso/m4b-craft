@@ -8,8 +8,8 @@ Créez et éditez des livres audio M4B localement : import de pistes, ordre natu
 chapitres, métadonnées, couverture, lecture et export AAC. Interface graphique,
 CLI et serveur MCP en lecture seule. Aucun service audio distant requis.
 
-**0.3.0-alpha.1 est une préversion en préparation.** Le badge reflète les versions
-réellement publiées ; ce dépôt ne prouve pas qu'une publication a eu lieu.
+**Version décrite : 0.3.0-alpha.1 (préversion).** Le badge et la page Releases
+indiquent les versions effectivement disponibles.
 Consultez les [versions GitHub, préversions incluses](https://github.com/aruel-perso/m4b-craft/releases)
 et choisissez les fichiers d'une même version :
 
@@ -35,6 +35,17 @@ L'historique de validation contient des tests Linux et Wine ; le nouveau travail
 CI macOS reste **non testé tant qu'une exécution réelle n'a pas réussi**. Aucun test
 interactif de l'interface Mac n'est revendiqué. Voir [VALIDATION.md](VALIDATION.md)
 et les [exécutions CI](https://github.com/aruel-perso/m4b-craft/actions).
+
+## Interface
+
+Au démarrage, créez ou ouvrez un projet, ou sélectionnez un projet récent. La croix
+retire seulement son lien. La langue suit celle de l’OS au premier lancement
+(FR/EN, repli anglais) et votre choix manuel est mémorisé dans Réglages.
+Le menu latéral se redimensionne par sa séparation verticale ; le nom du projet
+figure sous les menus. Métadonnées affiche la couverture. La barre inférieure
+regroupe lecture/pause, arrêt, précédent/suivant et déplacement dans la lecture.
+Les nouveaux projets utilisent 160 kb/s pour l’export AAC ; les projets existants
+conservent leur réglage. Le remux AAC compatible évite le réencodage.
 
 ## Projets et transport
 
@@ -66,11 +77,12 @@ alphas. La signature du manifeste, la taille et le SHA-256 du fichier téléchar
 sont vérifiés avec la clé publique embarquée, inchangée pour cette version.
 
 **Aucune installation sans votre consentement explicite.** Enregistrez le projet et
-arrêtez lecture/export avant de confirmer. Windows ouvre l'assistant MSI ; macOS
-utilise le DMG et la copie de l'application dans Applications. Suivez les indications
-de l'application pour sa fermeture et son remplacement. Ni la vérification au
-démarrage ni un téléchargement ne remplacent seuls votre application. Le comportement
-Rust de cette version doit être intégré et validé avec ce pipeline avant publication.
+arrêtez lecture/export avant de confirmer. Le clic sur « Mettre à jour » télécharge
+et vérifie le paquet sans navigateur, puis passe le relais à l’installation Windows
+ou au remplacement de l’application macOS. Des confirmations système peuvent rester
+nécessaires. La vérification au démarrage ne déclenche jamais seule l’installation.
+
+Sur macOS, le remplacement automatique exige une `.app` installée dans un dossier parent accessible en écriture par votre utilisateur. Utilisez `~/Applications` (à créer si nécessaire), copiez-y `m4b-Craft.app`, éjectez le DMG puis ouvrez cette copie. Si `/Applications` n’est pas accessible en écriture, une erreur est affichée ; aucune élévation administrateur n’est demandée. Cette alpha ne dispose pas de signature Apple Developer ID ni de notarisation.
 
 ## Développement
 

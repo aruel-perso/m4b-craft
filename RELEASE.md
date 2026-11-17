@@ -5,10 +5,9 @@ AppleSilicon ARM64 DMG. This is release tooling, not evidence of publication or 
 successful hosted build. Native Mac validation is pending the first actual CI run.
 See [VALIDATION.md](VALIDATION.md) for historical Linux/Wine evidence and current limits.
 
-The Rust workspace owner bumps the root Cargo version to `0.3.0-alpha.1` separately.
+The integrated Rust workspace version is `0.3.0-alpha.1`.
 All current release scripts and CI discover `[workspace.package].version` from root
-Cargo.toml through `scripts/release_common.py`; do not package this branch's older
-Rust snapshot as 0.3. Merge the Rust version/updater work before tagging. The updater
+Cargo.toml through `scripts/release_common.py`. The updater
 interface is `windows-x86_64` / `.msi` and `macos-aarch64` / `.dmg`; the GUI executable
 inside the Mac bundle is `Contents/MacOS/m4b-Craft`. The document type is `.m4bproj`.
 Declaring the type in Info.plist does not prove Finder open-event handling works.

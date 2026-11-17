@@ -1,5 +1,18 @@
 # Validation record — Windows alpha
 
+## Integrated 0.3.0-alpha.1 verification
+
+Fresh reviewer execution after the focused fixes passed: 43 Linux workspace tests,
+40 Windows tests across six executables under Wine, strict workspace/all-target
+Clippy, rustfmt and `git diff --check`. Real media tests include cover preview,
+AAC packet-hash preservation during remux, metadata/chapters and no-overwrite export.
+Release tooling tests passed 6 cases; source-fetch tests passed 4 cases.
+Save-target overwrite consent and update channel selection have regression tests.
+The duplicate central seek slider was removed in favor of the bottom transport.
+These results are not native Windows certification or successful macOS execution.
+The new two-platform hosted build and public release gates remain pending until
+actual GitHub execution; historical sections below describe earlier snapshots.
+
 ## Environment and scope
 
 Build host: Linux x86_64. Rust/Cargo 1.100.0, rustfmt and Clippy installed for this task. MinGW x86_64 cross-linker and Windows GNU Rust target installed. Native Linux media tests use system FFmpeg; Windows test executables use the Gyan FFmpeg 9.0.2 essentials build under Wine 9.0. Windows media binaries were downloaded only for verification, not included in the deliverable. Cargo.lock pins all dependencies. No commit, push, remote repository, GitHub publication or release was created.
@@ -136,3 +149,27 @@ download and consent/handoff. No GUI test, Developer ID, notarization, Authentic
 public release success or native platform acceptance is claimed. The manifest secret
 remains confined to the tag-only protected release environment; the release job
 requires both platform jobs to pass before signing and publishing either platform.
+
+## Focused 0.3 UI/updater fixes — 2026-11-17
+
+Save As now asks explicit overwrite consent for the final normalized `.m4bproj`
+path. Update-check messages carry the requested channel; mismatched results are
+ignored, channel changes clear candidates and persist immediately, and download
+requires a candidate matching the selected channel. Manual GitHub checks and the
+channel selector are available in Settings both with and without a project; the
+startup check remains mandatory. The central Tracks seek slider was removed;
+track play initiation and volume remain, with seeking in the bottom transport.
+
+macOS update staging errors explain that the installed `.app` parent must be
+user-writable and direct users to copy the app into `~/Applications`, eject the
+DMG and reopen the installed copy. No administrator elevation is requested.
+This alpha has no Apple Developer ID signing or notarization.
+
+Linux verification: `cargo test --workspace --offline` passed 43 tests;
+`cargo clippy --workspace --all-targets --locked --offline -- -D warnings`,
+`cargo fmt --all -- --check` and `git diff --check` passed. Added helper coverage
+for normalized save targets/overwrite consent, candidate-channel matching and the
+macOS recovery error; existing preference round-trip coverage includes the channel.
+Native dialog consent, pointer dragging and actual macOS replacement remain
+manual review items. No packaging, Wine tests, system installs, commits or pushes
+were performed for these fixes.
