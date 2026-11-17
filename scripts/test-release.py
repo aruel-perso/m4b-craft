@@ -289,8 +289,10 @@ class ReleaseTests(unittest.TestCase):
 def inspect(msi, scratch):
     tool = os.environ.get('MSIINFO','msiinfo')
     properties = subprocess.check_output([tool,'export',str(msi),'Property']).decode()
-    for value in [release.UPGRADE_CODE.upper(), release.MSI_VERSION,'M4B-Editor']:
+    for value in [release.UPGRADE_CODE.upper(), release.MSI_VERSION]:
         assert value.lower() in properties.lower(),value
+    property_rows = dict(row.split('\t', 1) for row in properties.splitlines()[3:] if '\t' in row)
+    assert property_rows.get('ProductName') == 'M4B Editor', property_rows.get('ProductName')
     files = subprocess.check_output([tool,'export',str(msi),'File']).decode()
     for name in ['m4b-editor.exe','m4b-editor-cli.exe','ffmpeg.exe','ffprobe.exe','7z.exe','7z.dll','Cargo.lock','LICENSE']:
         assert name in files,name
