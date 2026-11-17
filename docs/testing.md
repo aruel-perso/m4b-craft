@@ -65,7 +65,8 @@ The directory must contain pinned LAME and all three official 7-Zip 26.06
 archives. This checks actual PE x64 members, native ARM64 Mach-O bytes, matching
 source/license members and LAME fetch-cache reuse. The Windows CI job repeats it
 against its verified cache. Both installed-layout platform tests round-trip a
-synthetic ZIP with the bundled archiver. RAR/7Z/password/core integration and
-native GUI/upgrade acceptance still require platform execution. Official archive
+synthetic ZIP with the bundled archiver. Core integration also runs real
+RAR/7Z/password fixtures under Wine and on native Mac ARM64. Physical GUI/live
+upgrade acceptance remains separate. Official archive
 hashes and extracted member pins are in `scripts/release_common.py`; cache keys
 include the extraction recipe. No network blocker remains for supplied bytes.

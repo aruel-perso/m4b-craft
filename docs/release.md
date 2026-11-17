@@ -33,6 +33,9 @@ bound by the signature. SHA-256 sidecars alone do not authenticate updates.
 Renaming the repository does not update 0.3 clients: their API redirect host and
 release-origin checks reject the redirects. After renaming, the reviewer must
 create **aruel-perso/m4b-craft** as a release-only compatibility repository.
+Preserve historical tags and original release assets there too, so old download
+URLs keep working. Disable Actions in that repository before pushing old tags;
+historical workflows must not run as new release jobs.
 Publish a real `v0.4.0` release there. Do not rely on redirects or weaken trust.
 Keep canonical manifests named `update-v2-PLATFORM.json`; old clients use
 `update-PLATFORM.json` at the old slug.
@@ -64,11 +67,15 @@ redirection. Copy GPL source/license sidecars with both channels. Publish only
 after the reviewer checks exact filenames, hashes, signatures and native tests.
 No live native Mac upgrade has been verified by this packaging work.
 
-## Remaining acceptance
+## Validation scope
 
-Official 7-Zip 26.06 archives and extracted contents are verified locally;
-native bundled archive execution/password/offline acceptance remains required;
-see [development](development.md). Hosted builds, native Windows upgrade,
-native Mac GUI/live replacement and real release-key signing remain necessary.
+Official 7-Zip 26.06 archives and extracted contents are verified before bundling.
+Hosted Windows and native ARM64 Mac builds exercise the real bundled codecs and
+archive/password paths. Both canonical and compatibility DMGs are mounted and
+their installed CLI is exercised. The exact hosted MSI passes a Wine 0.3-to-0.4
+upgrade, actual AAC/MP3/FLAC exports, portable-copy and data-preserving uninstall.
+Wine is not native Windows certification. Physical GUI, audible playback and
+live in-app replacement remain unverified; ad hoc Mac sealing is not Developer
+ID/notarization. Real release-key signing is mandatory at publication.
 CI publishing targets only the canonical repository; compatibility publication
 is a reviewer-controlled separate operation with its own repository permissions.

@@ -4,7 +4,7 @@ M4B Editor uses Rust workspace packages `m4b-editor-core`, `m4b-editor-desktop`
 and `m4b-editor-cli`. The binaries are `m4b-editor` and `m4b-editor-cli`.
 Use the toolchain declared by CI and Python 3.11 or newer. The workspace version
 is read from Cargo.toml; release tooling never substitutes a hardcoded version.
-The 0.4.0 release requires the code changes and workspace version to be merged first.
+Keep the workspace version, application code and packaging at the same reviewed commit.
 
 ```sh
 cargo fetch --locked
@@ -51,5 +51,7 @@ and uses lipo on the Mac runner when thinning is necessary. Actual 26.06 Mac
 bytes are already thin ARM64. Member hashes, licenses, upstream archive hashes
 and exact cache records are verified before packaging. Both source sidecars
 include the original official archives and corresponding source. No first-launch
-download or proprietary RAR creation is provided. Native archive/password/offline
-acceptance remains required; archive/password behavior belongs to the core owner.
+download or proprietary RAR creation is provided. Real archive/password tests run
+with the bundled tools on native Mac ARM64 and Windows under Wine. Installed-layout
+tests use an unrelated working directory and verify adjacent-tool discovery.
+These checks do not certify physical GUI operation or audible playback.

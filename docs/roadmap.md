@@ -1,16 +1,20 @@
 # Roadmap
 
-0.4.0 targets stable M4B Editor naming, portable projects, preserved custom
+0.4.0 implements stable M4B Editor naming, portable projects, preserved custom
 chapters, bounded/cancellable media jobs, selected audio streams, metadata,
 AAC/MP3/FLAC exports, encoded previews, isolated recovery and FR/EN UI.
-The core and GUI implementation and its acceptance results are reviewed separately
-from the packaging changes. This list is release scope, not evidence of validation.
+Regression suites exercise the actual core and CLI paths, both UI languages,
+stale-save protection, read-only project loading and large MP4 metadata.
 
-Release gates: merge the 0.4.0 code/version, verify official archiver artifacts
-before bundling, run hosted Windows/Mac builds, inspect the exact installers,
-complete native upgrade/GUI tests, create the legacy release-only repository and
-publish signed manifests with the original trust key. Preserve corresponding
-sources and historical releases.
+Automated acceptance covers Linux, Windows tests under Wine and native Mac ARM64,
+bundled media/archive tools, MSI structure and mounted DMG installed CLI operation.
+The exact hosted MSI is also exercised through 0.3-to-0.4 upgrade, exports and
+uninstall while preserving external data. Physical Windows/Mac GUI, audible
+playback and live in-app replacement remain separate manual acceptance work.
+
+Publication requires signed manifests with the original trust key. The old-slug
+compatibility channel retains historical release assets/source tags and supports
+old clients without weakening origin or signature checks.
 
 Future work: publisher signing/notarization, other desktop architectures and
 platforms, Android backend abstraction. No DRM circumvention or advanced waveform
