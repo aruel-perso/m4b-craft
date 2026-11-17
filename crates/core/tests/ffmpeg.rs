@@ -1,4 +1,4 @@
-use m4b_core::*;
+use m4b_editor_core::*;
 use std::{
     path::Path,
     process::Command,
@@ -50,6 +50,8 @@ fn real_export_roundtrip_order_cover_and_no_overwrite() {
         genre: "Audiobook".into(),
         date: "2025".into(),
         copyright: "© Author".into(),
+        publisher: String::new(),
+        book_language: String::new(),
     };
     p.cover = Some(cover);
     let project = dir.path().join("book.json");
@@ -249,7 +251,7 @@ fn real_export_roundtrip_order_cover_and_no_overwrite() {
         .unwrap()
         .file_name()
         .to_string_lossy()
-        .starts_with(".m4b-craft-")));
+        .starts_with(".m4b-editor-")));
 }
 
 #[test]

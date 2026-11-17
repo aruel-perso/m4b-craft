@@ -1,0 +1,182 @@
+{
+  "provenance": "Generated mathematical tones and red pixels; CC0-1.0 dedication by project contributors",
+  "password": "fixture (public test data)",
+  "tools": {
+    "ffmpeg": "ffmpeg version 6.1.1-3ubuntu5 Copyright (c) 2000-2023 the FFmpeg developers",
+    "7z": "7-Zip 23.01 (x64) : Copyright (c) 1999-2023 Igor Pavlov : 2023-06-20"
+  },
+  "files": [
+    {
+      "path": "audio.7z",
+      "sha256": "593834fc77f8cd7e0c50e6f0beeee6628569562a411e5465d7d85bf1035a565e",
+      "expected": "valid synthetic input",
+      "container": "7z",
+      "encrypted": false,
+      "member_count": 1
+    },
+    {
+      "path": "audio.rar",
+      "sha256": "e2fb97ee50e742bbe53f8ce13915c40549e961bdd1483a9b6eb3c1ac6aab37a1",
+      "expected": "valid synthetic input",
+      "container": "rar",
+      "encrypted": false,
+      "member_count": 1
+    },
+    {
+      "path": "audio.zip",
+      "sha256": "718f629c6621eb161f6d9555ee10d08f1edcd828427c8f2f154317966233f987",
+      "expected": "valid synthetic input",
+      "container": "zip",
+      "encrypted": false,
+      "member_count": 1
+    },
+    {
+      "path": "corrupt.png",
+      "sha256": "5464533c9647b67eb320c40ccc5959537c09102ae75388f6a7675b433e745c9d",
+      "expected": "reject as corrupt image"
+    },
+    {
+      "path": "corrupt.zip",
+      "sha256": "5b1fa1191ed1e89061d268bb17df6a66724ff63c1c82c55f80c370523b53f0b8",
+      "expected": "reject hostile/corrupt archive",
+      "container": "zip",
+      "encrypted": false,
+      "member_count": 1
+    },
+    {
+      "path": "cover.jpg",
+      "sha256": "ccf767aa7daf69be51eb2715726fcfef67775de2b395797852eb24f7a5e5aa6d",
+      "expected": "valid synthetic input",
+      "width": 2,
+      "height": 2
+    },
+    {
+      "path": "cover.png",
+      "sha256": "97a3a410c9bca540512251c37ce63982edccbed54c6f2e1d06ec717b9f753e29",
+      "expected": "valid synthetic input",
+      "width": 2,
+      "height": 2
+    },
+    {
+      "path": "cover.ppm",
+      "sha256": "10c26cfa0a7fc676cfe5fa5f225f016cae335764114a3727dfac4a3258df66e2",
+      "expected": "valid synthetic input",
+      "width": 2,
+      "height": 2
+    },
+    {
+      "path": "encrypted.7z",
+      "sha256": "28b22d8cf78cf81e938dd276f35cd00af749dcc50a86b5d7b6e399b0aaab9b92",
+      "expected": "valid synthetic input",
+      "container": "7z",
+      "encrypted": true,
+      "member_count": 1
+    },
+    {
+      "path": "encrypted.zip",
+      "sha256": "3a3403eb4ba2d2860b701c4895339f6f7509d371fca91859cc9af766dab452ea",
+      "expected": "valid synthetic input",
+      "container": "zip",
+      "encrypted": true,
+      "member_count": 1
+    },
+    {
+      "path": "hostile-traversal.zip",
+      "sha256": "7e545541ee1f6c97ad94f3398093d23eb5b48b5550456019e4ef8152b37e1e91",
+      "expected": "reject hostile/corrupt archive",
+      "container": "zip",
+      "encrypted": false,
+      "member_count": 1
+    },
+    {
+      "path": "invalid-chapters.m4bproj",
+      "sha256": "06b9ffb94f375a4c0fda2d72b06815a3c53f1cf44aafaa9218b73a91162bcafc",
+      "expected": "reject hostile/corrupt archive"
+    },
+    {
+      "path": "legacy.json",
+      "sha256": "519388f1e9be09d7b06e24986b8b63c8dccb1f1e6b5cced1950644e8caea95b9",
+      "expected": "valid synthetic input"
+    },
+    {
+      "path": "multistream.mka",
+      "sha256": "80ec03ccb79cf8d24a2094c953f38800d8e7771ebbd06b84f3baac77b4c746fa",
+      "expected": "valid synthetic input",
+      "duration_ms": 250,
+      "duration_tolerance_ms": 2,
+      "audio_streams": 2
+    },
+    {
+      "path": "silence.wav",
+      "sha256": "f9cb049e2c6f64284db73c45b84f359205f22110c784c33e99642faa86c7722b",
+      "expected": "valid synthetic input",
+      "duration_ms": 250,
+      "duration_tolerance_ms": 2,
+      "audio_streams": 1
+    },
+    {
+      "path": "stereo.wav",
+      "sha256": "56de9e308c0b21c6aae3a547642f724b2a926c0760847ee74b5867a465bb415b",
+      "expected": "valid synthetic input",
+      "duration_ms": 250,
+      "duration_tolerance_ms": 2,
+      "audio_streams": 1
+    },
+    {
+      "path": "tagged.m4b",
+      "sha256": "65cb39418a47102b1fd1e6a183b736b25b80025f23e5d17db581b16088b0538c",
+      "expected": "valid synthetic input",
+      "duration_ms": 250,
+      "duration_tolerance_ms": 150,
+      "audio_streams": 1
+    },
+    {
+      "path": "tone.flac",
+      "sha256": "4e7ba8755448d3b8d5fdea9d2fc2311e5d28d431bfa843b2f76d3d7a3d76a7e5",
+      "expected": "valid synthetic input",
+      "duration_ms": 250,
+      "duration_tolerance_ms": 2,
+      "audio_streams": 1
+    },
+    {
+      "path": "tone440.wav",
+      "sha256": "0d872791548df2489472862389e019be16c2cbfb541cf6f4dfb6e98a5f3651d4",
+      "expected": "valid synthetic input",
+      "duration_ms": 250,
+      "duration_tolerance_ms": 2,
+      "audio_streams": 1
+    },
+    {
+      "path": "tone880.wav",
+      "sha256": "6a311ac9f8df7ed0220bd6380ea12135e4b54a3632632386ddaabb50673757ad",
+      "expected": "valid synthetic input",
+      "duration_ms": 250,
+      "duration_tolerance_ms": 2,
+      "audio_streams": 1
+    },
+    {
+      "path": "very-short.wav",
+      "sha256": "9da43174f06a922c5b3637a9245981d5aa04debc1b6fb0d70283405b364cac6d",
+      "expected": "valid synthetic input",
+      "duration_ms": 10,
+      "duration_tolerance_ms": 2,
+      "audio_streams": 1
+    },
+    {
+      "path": "zip64.zip",
+      "sha256": "50c842c9fe56f6b377a085fb8b17c63164d659e060976d3fd5e7b2540a7fa37f",
+      "expected": "valid synthetic input",
+      "container": "zip",
+      "encrypted": false,
+      "member_count": 1
+    },
+    {
+      "path": "../../crates/core/tests/fixtures/one-second-tone.mp3",
+      "sha256": "e6dc6c6e05d8fd7fcef291394efbe56dfde6c01c6fd494027df3c018e52ed13d",
+      "expected": "existing synthetic MP3 preserved",
+      "duration_ms": 1000,
+      "duration_tolerance_ms": 150
+    }
+  ],
+  "reproduction": "Python standard library for WAV/ZIP/RAR/project; FFmpeg bitexact modes for media. Exact hashes pin the corpus; encoder version differences use property tolerances. Encrypted 7z/ZIP use random salts and are retained unless --regenerate-encrypted. Public password: fixture."
+}

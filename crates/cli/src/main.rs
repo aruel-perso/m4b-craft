@@ -1,8 +1,8 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use m4b_core::{Cancel, DesktopFfmpeg, ExportEvent, MediaBackend, Project};
+use m4b_editor_core::{DesktopFfmpeg, ExportEvent, MediaBackend, Project};
 use std::{
-    io::{self, BufRead, Write},
+    io::{self, BufRead, Read, Write},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -13,13 +13,16 @@ use std::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "m4b-Craft: local audiobook creation; never overwrites exports"
+    about = "M4B Editor: local audiobook creation; never overwrites exports"
 )]
 struct Args {
     #[arg(long)]
     ffmpeg: Option<PathBuf>,
     #[arg(long)]
     ffprobe: Option<PathBuf>,
+    /// Maximum operation duration; Ctrl-C cancels every media operation.
+    #[arg(long, default_value_t = 86400)]
+    timeout_seconds: u64,
     #[command(subcommand)]
     command: Action,
 }
@@ -39,8 +42,19 @@ enum Action {
         description: String,
         #[arg(long)]
         cover: Option<PathBuf>,
-        #[arg(long, default_value_t = 96)]
+        #[arg(long, default_value = "")]
+        publisher: String,
+        #[arg(long, default_value = "")]
+        book_language: String,
+        #[arg(long)]
+        stream: Option<u32>,
+        #[arg(long, default_value_t = 160)]
         bitrate: u32,
+        #[arg(long, default_value = "m4b", value_parser = ["m4b", "mp3", "flac"])]
+        format: String,
+        /// Read an archive password from a pipe without putting it in argv.
+        #[arg(long)]
+        password_stdin: bool,
         #[arg(required = true)]
         tracks: Vec<PathBuf>,
     },
@@ -56,6 +70,36 @@ enum Action {
     Probe {
         input: PathBuf,
     },
+    /// Copy a project with all media and cover into a new portable directory.
+    Copy {
+        project: PathBuf,
+        destination: PathBuf,
+    },
+    /// Encode up to 30 seconds with the project output settings.
+    Preview {
+        project: PathBuf,
+        output: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        start_ms: u64,
+        #[arg(long, default_value_t = 10000)]
+        duration_ms: u64,
+        #[arg(long, value_parser = ["m4b", "mp3", "flac"])]
+        format: Option<String>,
+    },
+    /// Select an absolute audio stream index on one track.
+    Stream {
+        project: PathBuf,
+        track: usize,
+        index: u32,
+    },
+    /// Import audio/archives transactionally into an existing project.
+    Import {
+        project: PathBuf,
+        #[arg(long)]
+        password_stdin: bool,
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+    },
     Encoders,
     Check {
         project: PathBuf,
@@ -63,6 +107,8 @@ enum Action {
     Export {
         project: PathBuf,
         output: PathBuf,
+        #[arg(long, value_parser = ["m4b", "mp3", "flac"])]
+        format: Option<String>,
     },
 
     /// Sequential newline JSON-RPC MCP server; stdout contains only protocol messages.
@@ -77,6 +123,13 @@ fn main() -> Result<()> {
     if let Some(path) = args.ffprobe {
         backend.ffprobe = path;
     }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let c = cancel.clone();
+    ctrlc::set_handler(move || c.store(true, Ordering::Relaxed))?;
+    backend.job = m4b_editor_core::Job::new(
+        cancel.clone(),
+        std::time::Duration::from_secs(args.timeout_seconds),
+    );
     match args.command {
         Action::New {
             project,
@@ -85,21 +138,51 @@ fn main() -> Result<()> {
             narrator,
             description,
             cover,
+            publisher,
+            book_language,
+            stream,
             bitrate,
+            format,
+            password_stdin,
             tracks,
         } => {
             anyhow::ensure!(!project.exists(), "Project exists");
             let mut p = Project::default();
-            p.import(&backend, tracks)?;
-            p.metadata = m4b_core::Metadata {
-                title,
-                author,
-                narrator,
-                description,
-                ..Default::default()
-            };
+            let password = read_password(password_stdin)?;
+            p.import_assets_with(
+                &backend,
+                tracks,
+                &project.with_extension("assets"),
+                &backend.job,
+                password.as_deref(),
+            )?;
+            if let Some(stream) = stream {
+                for index in 0..p.tracks.len() {
+                    p.select_stream(&backend, index, stream)?;
+                }
+            }
+            for (input, field) in [
+                (title, &mut p.metadata.title),
+                (author, &mut p.metadata.author),
+                (narrator, &mut p.metadata.narrator),
+                (description, &mut p.metadata.description),
+                (publisher, &mut p.metadata.publisher),
+                (book_language, &mut p.metadata.book_language),
+            ] {
+                if !input.is_empty() {
+                    *field = input;
+                }
+            }
+            p.name = project
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
             p.settings.bitrate_kbps = bitrate;
-            p.cover = cover.map(std::fs::canonicalize).transpose()?;
+            p.settings.format = parse_format(&format);
+            if let Some(cover) = cover {
+                p.cover = Some(std::fs::canonicalize(cover)?);
+            }
             p.validate()?;
             p.save_new(&project)?;
             println!(
@@ -125,7 +208,25 @@ fn main() -> Result<()> {
         }
         Action::Probe { input } => {
             let p = backend.open(&input)?;
-            println!("{}", serde_json::to_string_pretty(&p)?);
+            let mut value = serde_json::to_value(&p)?;
+            value["audio_streams"] = serde_json::to_value(backend.audio_streams(&input)?)?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        Action::Import {
+            project,
+            password_stdin,
+            inputs,
+        } => {
+            let password = read_password(password_stdin)?;
+            let mut p = Project::load(&project)?;
+            p.import_assets_with(
+                &backend,
+                inputs,
+                &project.with_extension("assets"),
+                &backend.job,
+                password.as_deref(),
+            )?;
+            p.save(&project)?;
         }
         Action::Encoders => {
             for e in backend.encoders()? {
@@ -136,7 +237,7 @@ fn main() -> Result<()> {
             let p = Project::load(&project)?;
             p.validate()?;
             for t in &p.tracks {
-                let fresh = backend.probe(&t.path)?;
+                let fresh = backend.probe_stream(&t.path, t.stream_index)?;
                 anyhow::ensure!(
                     fresh.track.duration_ms.abs_diff(t.duration_ms) <= 100,
                     "Source changed"
@@ -149,11 +250,50 @@ fn main() -> Result<()> {
                 p.estimated_bytes()
             );
         }
-        Action::Export { project, output } => {
-            let p = Project::load(&project)?;
-            let cancel: Cancel = Arc::new(AtomicBool::new(false));
-            let c = cancel.clone();
-            ctrlc::set_handler(move || c.store(true, Ordering::Relaxed))?;
+        Action::Copy {
+            project,
+            destination,
+        } => {
+            println!(
+                "{}",
+                Project::load(&project)?
+                    .copy_to_with_job(&destination, &backend.job)?
+                    .display()
+            );
+        }
+        Action::Stream {
+            project,
+            track,
+            index,
+        } => {
+            let mut p = Project::load(&project)?;
+            p.select_stream(&backend, track, index)?;
+            p.save(&project)?;
+        }
+        Action::Preview {
+            project,
+            output,
+            start_ms,
+            duration_ms,
+            format,
+        } => {
+            let mut p = Project::load(&project)?;
+            if let Some(format) = format {
+                p.settings.format = parse_format(&format);
+            }
+            backend.encoded_preview(&p, &output, start_ms, duration_ms, cancel, &mut |e| {
+                eprintln!("{e:?}")
+            })?;
+        }
+        Action::Export {
+            project,
+            output,
+            format,
+        } => {
+            let mut p = Project::load(&project)?;
+            if let Some(format) = format {
+                p.settings.format = parse_format(&format);
+            }
             backend.export(&p, &output, cancel, &mut |e| match e {
                 ExportEvent::Log(s) => eprintln!("{s}"),
                 ExportEvent::Progress(p) => eprintln!("{:.0}%", p * 100.),
@@ -199,11 +339,11 @@ fn mcp(backend: &DesktopFfmpeg) -> Result<()> {
         let result: Result<Value> = (|| {
             Ok(match req["method"].as_str().unwrap_or("") {
                 "initialize" => {
-                    json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"m4b-Craft","version":env!("CARGO_PKG_VERSION")}})
+                    json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"M4B Editor","version":env!("CARGO_PKG_VERSION")}})
                 }
                 "ping" => json!({}),
                 "tools/list" => {
-                    json!({"tools":[{"name":"probe","description":"Read local audio metadata and chapters","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}},{"name":"inspect_project","description":"Read a local m4b-Craft project","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}]})
+                    json!({"tools":[{"name":"probe","description":"Read local audio metadata and chapters","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}},{"name":"inspect_project","description":"Read a local M4B Editor project","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}]})
                 }
                 "tools/call" => {
                     let path = PathBuf::from(
@@ -243,4 +383,27 @@ fn mcp(backend: &DesktopFfmpeg) -> Result<()> {
         io::stdout().flush()?;
     }
     Ok(())
+}
+
+fn parse_format(value: &str) -> m4b_editor_core::ExportFormat {
+    match value {
+        "mp3" => m4b_editor_core::ExportFormat::Mp3,
+        "flac" => m4b_editor_core::ExportFormat::Flac,
+        _ => m4b_editor_core::ExportFormat::M4b,
+    }
+}
+
+fn read_password(requested: bool) -> Result<Option<String>> {
+    if !requested {
+        return Ok(None);
+    }
+    use std::io::IsTerminal;
+    anyhow::ensure!(
+        !io::stdin().is_terminal(),
+        "Use a pipe for --password-stdin to avoid terminal echo"
+    );
+    let mut password = String::new();
+    io::stdin().lock().take(4097).read_line(&mut password)?;
+    anyhow::ensure!(password.len() <= 4096, "Password exceeds limit");
+    Ok(Some(password.trim_end_matches(['\r', '\n']).to_owned()))
 }

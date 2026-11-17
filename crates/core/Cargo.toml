@@ -1,5 +1,5 @@
 [package]
-name = "m4b-core"
+name = "m4b-editor-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,3 +11,7 @@ tempfile.workspace = true
 dunce = "1"
 flate2 = "1"
 crc32fast = "1"
+sha2 = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

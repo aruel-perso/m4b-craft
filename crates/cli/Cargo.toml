@@ -1,13 +1,17 @@
 [package]
-name = "m4b-cli"
+name = "m4b-editor-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 [dependencies]
-m4b-core = { path = "../core" }
+m4b-editor-core = { path = "../core" }
 anyhow.workspace = true
 serde_json.workspace = true
 ctrlc = "3"
 clap = { version = "4", features = ["derive"] }
 [dev-dependencies]
 tempfile.workspace = true
+
+[[bin]]
+name = "m4b-editor-cli"
+path = "src/main.rs"

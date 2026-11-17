@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Generate redistributable synthetic fixtures; --long opts into a 1h WAV.
+No downloads. FFmpeg and 7z versions are recorded; exact hashes describe the
+checked-in corpus, while audio comparisons use explicit duration tolerances.
+"""
+import argparse
+import hashlib
+import json
+import math
+from pathlib import Path
+import shutil
+import sys
+import struct
+import subprocess
+import wave
+import zipfile
+import zlib
+
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / "tests/fixtures"
+
+def run(*args):
+    subprocess.run(args, check=True, stdout=subprocess.DEVNULL)
+
+def wav(path, frequency, rate=8000, seconds=0.25):
+    with wave.open(str(path), "wb") as output:
+        output.setparams((1, 2, rate, 0, "NONE", "not compressed"))
+        total = round(rate * seconds)
+        for start in range(0, total, rate):
+            output.writeframesraw(b"".join(struct.pack("<h", round(4000 * math.sin(2 * math.pi * frequency * i / rate))) for i in range(start, min(total,start+rate))))
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--long", action="store_true")
+    parser.add_argument("--check", action="store_true", help="Verify the frozen corpus hashes without regenerating encodings")
+    parser.add_argument("--regenerate-encrypted", action="store_true", help="Replace encrypted fixtures (7z uses random salts, so hashes change)")
+    args = parser.parse_args()
+    OUT.mkdir(parents=True, exist_ok=True)
+    if args.check:
+        manifest = json.loads((OUT / "manifest.json").read_text())
+        for entry in manifest["files"]:
+            assert hashlib.sha256((OUT / entry["path"]).read_bytes()).hexdigest() == entry["sha256"], entry["path"]
+        print(f"Verified {len(manifest['files'])} fixture hashes")
+        return
+    archiver = next((str(p) for name in ("7z.exe", "7zz.exe", "7z", "7zz") for p in [Path(sys.executable).resolve().parent / name] if p.is_file()), None) or shutil.which("7z") or shutil.which("7zz")
+    if not archiver:
+        parser.error("Fixture generation requires 7z or 7zz beside Python or on PATH")
+    wav(OUT / "tone440.wav", 440)
+    wav(OUT / "tone880.wav", 880, 16000)
+    wav(OUT / "silence.wav", 0)
+    wav(OUT / "very-short.wav", 440, seconds=0.01)
+    # PNG encoder using only the standard library; no image package required.
+    def chunk(kind, data):
+        return struct.pack(">I",len(data)) + kind + data + struct.pack(">I",zlib.crc32(kind+data))
+    (OUT / "cover.png").write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR",struct.pack(">IIBBBBB",2,2,8,2,0,0,0)) + chunk(b"IDAT",zlib.compress((b"\x00"+b"\xff\x00\x00"*2)*2)) + chunk(b"IEND",b""))
+    (OUT / "cover.ppm").write_bytes(b"P6\n2 2\n255\n" + b"\xff\x00\x00" * 4)
+    (OUT / "corrupt.png").write_bytes(b"not an image")
+    common = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-threads", "1"]
+    run(*common, "-i", str(OUT / "tone440.wav"), "-c:a", "aac", "-fflags", "+bitexact", "-flags:a", "+bitexact", "-metadata", "title=Écoute synthétique", str(OUT / "tagged.m4b"))
+    run(*common, "-i", str(OUT / "tone440.wav"), "-i", str(OUT / "tone880.wav"), "-map", "0:a", "-map", "1:a", "-c:a", "flac", "-fflags", "+bitexact", "-flags:a", "+bitexact", str(OUT / "multistream.mka"))
+    run(*common, "-i", str(OUT / "cover.png"), "-frames:v", "1", "-threads", "1", "-flags:v", "+bitexact", str(OUT / "cover.jpg"))
+    run(*common, "-i", str(OUT / "tone440.wav"), "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", str(OUT / "stereo.wav"))
+    run(*common, "-i", str(OUT / "tone440.wav"), "-c:a", "flac", "-fflags", "+bitexact", "-flags:a", "+bitexact", str(OUT / "tone.flac"))
+    with zipfile.ZipFile(OUT / "audio.zip", "w") as archive:
+        archive.writestr(zipfile.ZipInfo("tone440.wav", (2000,1,1,0,0,0)), (OUT / "tone440.wav").read_bytes())
+    with zipfile.ZipFile(OUT / "zip64.zip", "w") as archive:
+        with archive.open(zipfile.ZipInfo("tone440.wav", (2000,1,1,0,0,0)), "w", force_zip64=True) as entry:
+            entry.write((OUT / "tone440.wav").read_bytes())
+    # Password is public test data, never a user's secret. No password in argv.
+    # 7z creation requires -pPASSWORD; fixture creation uses a public fixed value.
+    for name, extra in [("audio.7z", []), ("encrypted.7z", ["-pfixture", "-mhe=on"]), ("encrypted.zip", ["-pfixture", "-tzip"])]:
+        path = OUT / name
+        if "encrypted" in name and path.exists() and not args.regenerate_encrypted:
+            continue  # Preserve frozen cryptographic salts; generation is semantically reproducible.
+        path.unlink(missing_ok=True)
+        run(archiver, "a", "-bd", "-y", "-mtc=off", "-mtm=off", "-mta=off", *extra, str(path), str(OUT / "tone440.wav"))
+    # A genuine RAR 2.x stored member: signature, CRC-protected main/file/end
+    # headers and unchanged WAV payload. Validated with `7z t`, not a fake listing.
+    def rar_header(kind, flags, body):
+        data = struct.pack("<BHH", kind, flags, 7 + len(body)) + body
+        return struct.pack("<H", zlib.crc32(data) & 65535) + data
+    data = (OUT / "tone440.wav").read_bytes()
+    name = b"tone440.wav"
+    rar = b"Rar!\x1a\x07\x00" + rar_header(0x73, 0, b"\0" * 6)
+    rar += rar_header(0x74, 0x8000, struct.pack("<IIBIIBBHI", len(data), len(data), 3, zlib.crc32(data), 0x28210000, 20, 0x30, len(name), 0o100644) + name)
+    (OUT / "audio.rar").write_bytes(rar + data + rar_header(0x7b, 0, b""))
+    run(archiver, "t", str(OUT / "audio.rar"))
+    with zipfile.ZipFile(OUT / "hostile-traversal.zip", "w") as archive:
+        archive.writestr(zipfile.ZipInfo("../escape.wav", (2000,1,1,0,0,0)), data)
+    (OUT / "corrupt.zip").write_bytes(b"PK invalid")
+    project = {"version": 1, "metadata": {"title": "Ancien livre"}, "tracks": [{"path": "tone440.wav", "duration_ms": 250, "codec": "pcm_s16le", "sample_rate": 8000, "channels": 1}], "chapters": [{"start_ms": 0, "title": "Début"}, {"start_ms": 100, "title": "Personnalisé"}], "cover": "cover.ppm", "settings": {"language": "fr", "theme": "system", "bitrate_kbps": 96}}
+    (OUT / "legacy.json").write_text(json.dumps(project, ensure_ascii=False, indent=2) + "\n")
+    project["chapters"][1]["start_ms"] = 9999
+    (OUT / "invalid-chapters.m4bproj").write_text(json.dumps(project, ensure_ascii=False, indent=2) + "\n")
+    manifest = {"provenance": "Generated mathematical tones and red pixels; CC0-1.0 dedication by project contributors", "password": "fixture (public test data)", "tools": {"ffmpeg": subprocess.check_output(["ffmpeg", "-version"], text=True).splitlines()[0], "7z": subprocess.check_output([archiver], text=True).splitlines()[1]}, "files": []}
+    for path in sorted(OUT.iterdir()):
+        if path.name in ["manifest.json", "long-opt-in.wav"]:
+            continue
+        properties = {"expected": "reject as corrupt image"} if path.name == "corrupt.png" else {"expected": "reject hostile/corrupt archive" if path.name in ["corrupt.zip", "hostile-traversal.zip", "invalid-chapters.m4bproj"] else "valid synthetic input"}
+        if path.suffix in [".wav", ".m4b", ".mka", ".flac"]:
+            properties.update(duration_ms=10 if path.name == "very-short.wav" else 250, duration_tolerance_ms=150 if path.suffix == ".m4b" else 2, audio_streams=2 if path.suffix == ".mka" else 1)
+        if path.suffix in [".zip", ".7z", ".rar"]:
+            properties.update(container=path.suffix[1:], encrypted=path.name.startswith("encrypted"), member_count=1)
+        if path.suffix in [".png", ".jpg", ".ppm"] and not path.name.startswith("corrupt"):
+            properties.update(width=2, height=2)
+        manifest["files"].append({"path": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), **properties})
+    original_mp3 = ROOT / "crates/core/tests/fixtures/one-second-tone.mp3"
+    manifest["files"].append({"path": "../../crates/core/tests/fixtures/one-second-tone.mp3", "sha256": hashlib.sha256(original_mp3.read_bytes()).hexdigest(), "expected": "existing synthetic MP3 preserved", "duration_ms": 1000, "duration_tolerance_ms": 150})
+    manifest["reproduction"] = "Python standard library for WAV/ZIP/RAR/project; FFmpeg bitexact modes for media. Exact hashes pin the corpus; encoder version differences use property tolerances. Encrypted 7z/ZIP use random salts and are retained unless --regenerate-encrypted. Public password: fixture."
+    (OUT / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+    if args.long:
+        wav(OUT / "long-opt-in.wav", 440, seconds=3600)
+
+if __name__ == "__main__":
+    main()

@@ -130,6 +130,29 @@ impl Preferences {
         self.recent.retain(|p| p != path);
     }
 }
+/// Copy legacy preferences only when there is no canonical file. Originals are
+/// retained, and a concurrent canonical writer always wins.
+pub fn load_migrated(path: &Path, legacy: Option<&Path>) -> Preferences {
+    if !path.exists() {
+        if let Some(bytes) = legacy.and_then(|p| std::fs::read(p).ok()) {
+            if serde_json::from_slice::<Preferences>(&bytes).is_ok() {
+                let migrate = || -> std::io::Result<()> {
+                    use std::io::Write;
+                    let mut file = tempfile::NamedTempFile::new_in(
+                        path.parent().unwrap_or_else(|| Path::new(".")),
+                    )?;
+                    file.write_all(&bytes)?;
+                    file.as_file().sync_all()?;
+                    file.persist_noclobber(path).map_err(|e| e.error)?;
+                    Ok(())
+                };
+                let _ = migrate();
+            }
+        }
+    }
+    Preferences::load(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +196,28 @@ mod tests {
         prefs.save(&config).unwrap();
         assert!(Preferences::load(&config).recent.is_empty());
         assert!(p.exists());
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    #[test]
+    fn migration_preserves_originals_and_never_replaces_canonical_preferences() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("old.json");
+        let new = root.path().join("new.json");
+        let bytes = br#"{"language":"fr","sidebar":240,"recent":["book.json"],"prerelease":true}"#;
+        std::fs::write(&old, bytes).unwrap();
+        let prefs = load_migrated(&new, Some(&old));
+        assert_eq!(prefs.language, "fr");
+        assert_eq!(prefs.recent, vec![PathBuf::from("book.json")]);
+        assert!(prefs.prerelease);
+        assert_eq!(std::fs::read(&old).unwrap(), bytes);
+        let mut prefs = prefs;
+        prefs.language = "en".into();
+        prefs.save(&new).unwrap();
+        assert_eq!(load_migrated(&new, Some(&old)).language, "en");
+        assert_eq!(std::fs::read(&old).unwrap(), bytes);
     }
 }

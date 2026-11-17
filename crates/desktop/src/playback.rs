@@ -1,5 +1,5 @@
 //! Bounded PCM preview. The worker owns the device and every decoder process.
-use m4b_core::DesktopFfmpeg;
+use m4b_editor_core::DesktopFfmpeg;
 use rodio::{OutputStream, Sink, Source};
 use std::{
     io::{BufReader, Read},
@@ -17,7 +17,7 @@ const CHANNELS: u16 = 2;
 const SAMPLES_PER_MS: u64 = 96;
 
 pub enum CommandMessage {
-    Play(PathBuf, u64),
+    Play(PathBuf, u64, Option<u32>),
     Pause(bool),
     Stop,
     Volume(f32),
@@ -175,7 +175,7 @@ fn pump(mut input: impl Read, tx: mpsc::SyncSender<Vec<i16>>) -> Result<(), Stri
         }
     }
 }
-fn decoder_command(path: PathBuf, offset: u64) -> Command {
+fn decoder_command(path: PathBuf, offset: u64, stream: Option<u32>) -> Command {
     let mut command = Command::new(DesktopFfmpeg::default().ffmpeg);
     command
         .args([
@@ -192,7 +192,9 @@ fn decoder_command(path: PathBuf, offset: u64) -> Command {
         .arg(path)
         .args([
             "-map",
-            "0:a:0",
+            &stream
+                .map(|i| format!("0:{i}"))
+                .unwrap_or_else(|| "0:a:0".into()),
             "-vn",
             "-f",
             "s16le",
@@ -217,14 +219,21 @@ fn decoder_command(path: PathBuf, offset: u64) -> Command {
 fn start(
     path: PathBuf,
     offset: u64,
+    stream: Option<u32>,
     handle: &rodio::OutputStreamHandle,
     volume: f32,
 ) -> Result<Decoder, String> {
     let sink = Sink::try_new(handle).map_err(|e| format!("Audio: {e}"))?;
-    start_into_sink(path, offset, sink, volume)
+    start_into_sink(path, offset, stream, sink, volume)
 }
-fn start_into_sink(path: PathBuf, offset: u64, sink: Sink, volume: f32) -> Result<Decoder, String> {
-    let mut child = decoder_command(path, offset)
+fn start_into_sink(
+    path: PathBuf,
+    offset: u64,
+    stream: Option<u32>,
+    sink: Sink,
+    volume: f32,
+) -> Result<Decoder, String> {
+    let mut child = decoder_command(path, offset, stream)
         .spawn()
         .map_err(|e| format!("FFmpeg: {e}"))?;
     let stdout = child.stdout.take().unwrap();
@@ -286,7 +295,7 @@ fn run(
                 }
                 state = State::default();
             }
-            Ok(CommandMessage::Play(path, offset)) => {
+            Ok(CommandMessage::Play(path, offset, stream)) => {
                 if let Some(d) = decoder.take() {
                     d.stop();
                 }
@@ -301,7 +310,7 @@ fn run(
                     }
                 }
                 if let Some((_, handle)) = &output {
-                    match start(path, offset, handle, volume) {
+                    match start(path, offset, stream, handle, volume) {
                         Ok(d) => {
                             decoder = Some(d);
                             state.active = true;
@@ -470,7 +479,7 @@ mod tests {
         }
         std::fs::write(&path, wav).unwrap();
         let (sink, mut rendered) = Sink::new_idle();
-        let decoder = start_into_sink(path, 500, sink, 0.5).unwrap();
+        let decoder = start_into_sink(path, 500, None, sink, 0.5).unwrap();
         let consumed = decoder.consumed.clone();
         let mut nonzero = false;
         for _ in 0..9600 {
@@ -541,7 +550,7 @@ mod tests {
         wav.extend_from_slice(&96000u32.to_le_bytes());
         wav.resize(96044, 0);
         std::fs::write(&path, wav).unwrap();
-        let mut child = decoder_command(path.clone(), 500).spawn().unwrap();
+        let mut child = decoder_command(path.clone(), 500, None).spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (tx, rx) = mpsc::sync_channel(4);
         let reader = thread::spawn(move || pump(stdout, tx));
@@ -555,5 +564,38 @@ mod tests {
             String::from_utf8_lossy(&result.stderr)
         );
         assert_eq!(samples, 48000); // half a second, stereo
+    }
+}
+
+#[cfg(test)]
+mod selected_stream_tests {
+    use super::*;
+    #[test]
+    fn decoder_plays_the_selected_absolute_stream() {
+        let path = std::env::var_os("M4B_EDITOR_TEST_FIXTURES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
+            })
+            .join("multistream.mka");
+        for (index, expected) in [(0, 440.0_f64), (1, 880.0_f64)] {
+            let output = decoder_command(path.clone(), 0, Some(index))
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let samples: Vec<i16> = output
+                .stdout
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|s| i16::from_le_bytes([s[0], s[1]]))
+                .collect();
+            let crossings = samples.windows(2).filter(|s| s[0] <= 0 && s[1] > 0).count();
+            let frequency = crossings as f64 * f64::from(RATE) / samples.len() as f64;
+            assert!(
+                (frequency - expected).abs() < 20.,
+                "{frequency} != {expected}"
+            );
+        }
     }
 }

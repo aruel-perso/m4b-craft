@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "metadata": {
+    "title": "Ancien livre"
+  },
+  "tracks": [
+    {
+      "path": "tone440.wav",
+      "duration_ms": 250,
+      "codec": "pcm_s16le",
+      "sample_rate": 8000,
+      "channels": 1
+    }
+  ],
+  "chapters": [
+    {
+      "start_ms": 0,
+      "title": "Début"
+    },
+    {
+      "start_ms": 9999,
+      "title": "Personnalisé"
+    }
+  ],
+  "cover": "cover.ppm",
+  "settings": {
+    "language": "fr",
+    "theme": "system",
+    "bitrate_kbps": 96
+  }
+}

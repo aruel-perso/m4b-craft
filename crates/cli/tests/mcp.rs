@@ -8,10 +8,10 @@ use std::{
 fn stdio_mcp_reads_projects_and_keeps_stdout_protocol_only() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("project.json");
-    let mut project = m4b_core::Project::default();
+    let mut project = m4b_editor_core::Project::default();
     project.metadata.title = "MCP book".into();
     project.save(&path).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_m4b-cli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_m4b-editor-cli"))
         .arg("mcp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

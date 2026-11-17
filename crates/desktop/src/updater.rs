@@ -1,4 +1,14 @@
 //! Signed native updater. Trust is rooted only in the compiled Ed25519 public key.
+//!
+//! Rename delivery contract (also consumed by the packaging owner): canonical
+//! clients use m4b-editor and update-v2-PLATFORM.json. Version 0.3 cannot follow
+//! repository-rename redirects. A reviewer must create a release-only repository
+//! at aruel-perso/m4b-craft and publish independently signed update-PLATFORM.json
+//! envelopes with exact old asset names/old repository origins. It must retain
+//! the same pinned key. Windows payloads retain m4b-Craft.exe for the old helper;
+//! the legacy Mac DMG retains m4b-Craft.app/Contents/MacOS/m4b-Craft. Once that
+//! client runs 0.4, this updater uses only the canonical origin. Supporting old
+//! installed bundle roots below never authorizes old download origins.
 use anyhow::{ensure, Context, Result};
 use ed25519_dalek::{Signature, VerifyingKey};
 use reqwest::{blocking::Client, redirect::Policy, Url};
@@ -10,7 +20,7 @@ use std::{
     time::Duration,
 };
 
-const REPO: &str = "https://github.com/aruel-perso/m4b-craft/releases/download/";
+const REPO: &str = "https://github.com/aruel-perso/m4b-editor/releases/download/";
 const MAX_MSI: u64 = 512 * 1024 * 1024;
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 const PLATFORM: &str = "windows-x86_64";
@@ -109,7 +119,7 @@ fn allowed_redirect(url: &Url) -> bool {
 }
 fn client() -> Result<Client> {
     Ok(Client::builder()
-        .user_agent("m4b-Craft/0.2 updater")
+        .user_agent("M4B-Editor/0.4 updater")
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(180))
         .https_only(true)
@@ -164,7 +174,7 @@ fn verify_platform(
     ensure!(
         m.filename
             == format!(
-                "m4b-Craft-{}-{}.{}",
+                "M4B-Editor-{}-{}.{}",
                 m.version,
                 platform,
                 extension(platform)?
@@ -200,7 +210,7 @@ pub fn check(channel: Channel, busy: bool) -> Result<Verified> {
     let client = client()?;
     let releases: Vec<Release> = serde_json::from_slice(&get(
         &client,
-        "https://api.github.com/repos/aruel-perso/m4b-craft/releases?per_page=100",
+        "https://api.github.com/repos/aruel-perso/m4b-editor/releases?per_page=100",
         1024 * 1024,
     )?)?;
     let mut versions: Vec<Version> = releases
@@ -217,7 +227,7 @@ pub fn check(channel: Channel, busy: bool) -> Result<Verified> {
     let result = verify(
         &get(
             &client,
-            &format!("{REPO}v{version}/update-{PLATFORM}.json"),
+            &format!("{REPO}v{version}/update-v2-{PLATFORM}.json"),
             16384,
         )?,
         channel,
@@ -362,7 +372,7 @@ fn arm64_binary(path: &std::path::Path) -> Result<bool> {
 
 #[cfg(any(target_os = "macos", test))]
 fn mac_install_location_error(parent: &std::path::Path) -> String {
-    format!("Cannot stage update in {}. Run m4b-Craft from an installed .app in a user-writable directory such as ~/Applications (create it and copy the app there, eject the DMG, then reopen it). Automatic updates require a writable installation directory; no administrator elevation is requested. / Lancez l’application installée dans un dossier accessible en écriture, par exemple ~/Applications, éjectez le DMG puis relancez-la. Aucune élévation administrateur n’est demandée.", parent.display())
+    format!("Cannot stage update in {}. Run M4B Editor from an installed .app in a user-writable directory such as ~/Applications (create it and copy the app there, eject the DMG, then reopen it). Automatic updates require a writable installation directory; no administrator elevation is requested. / Lancez l’application installée dans un dossier accessible en écriture, par exemple ~/Applications, éjectez le DMG puis relancez-la. Aucune élévation administrateur n’est demandée.", parent.display())
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -377,8 +387,8 @@ impl Download {
             .context("Missing app bundle")?;
         ensure!(
             app.extension().is_some_and(|e| e == "app")
-                && exe.ends_with("Contents/MacOS/m4b-Craft"),
-            "Not running from an installed .app. Copy m4b-Craft.app to a user-writable directory such as ~/Applications, eject the DMG, then reopen the installed app."
+                && (exe.ends_with("Contents/MacOS/m4b-editor") || exe.ends_with("Contents/MacOS/m4b-Craft")),
+            "Not running from an installed .app. Copy M4B Editor.app to a user-writable directory such as ~/Applications, eject the DMG, then reopen the installed app."
         );
         let parent = app.parent().context("Missing installation directory")?;
         let stage = tempfile::Builder::new()
@@ -392,14 +402,14 @@ impl Download {
             .arg(self.file.path())
             .status()?;
         ensure!(status.success(), "Unable to mount verified DMG");
-        let staged = stage.path().join("m4b-Craft.app");
-        let source = mount.path().join("m4b-Craft.app");
+        let staged = stage.path().join("M4B Editor.app");
+        let source = mount.path().join("M4B Editor.app");
         let copy = (|| -> Result<()> {
             ensure!(
-                source.join("Contents/MacOS/m4b-Craft").is_file(),
+                source.join("Contents/MacOS/m4b-editor").is_file(),
                 "DMG missing application"
             );
-            for name in ["m4b-Craft", "m4b-cli", "ffmpeg", "ffprobe"] {
+            for name in ["m4b-editor", "m4b-editor-cli", "ffmpeg", "ffprobe"] {
                 let binary = source.join("Contents/MacOS").join(name);
                 ensure!(binary.is_file(), "Bundle missing {name}");
                 ensure!(arm64_binary(&binary)?, "Bundle binary is not ARM64: {name}");
@@ -498,8 +508,8 @@ mod tests {
     fn signed(version: &str, change: impl FnOnce(&mut serde_json::Value)) -> (Vec<u8>, [u8; 32]) {
         let key = SigningKey::from_bytes(&[42; 32]);
         let mut value = serde_json::json!({"version":version,"platform":PLATFORM,
-            "filename":format!("m4b-Craft-{version}-{PLATFORM}.{}", extension(PLATFORM).unwrap()),"sha256":"ab".repeat(32),"size":10,
-            "url":format!("{REPO}v{version}/m4b-Craft-{version}-{PLATFORM}.{}", extension(PLATFORM).unwrap())});
+            "filename":format!("M4B-Editor-{version}-{PLATFORM}.{}", extension(PLATFORM).unwrap()),"sha256":"ab".repeat(32),"size":10,
+            "url":format!("{REPO}v{version}/M4B-Editor-{version}-{PLATFORM}.{}", extension(PLATFORM).unwrap())});
         change(&mut value);
         let payload = value.to_string();
         let signature = hex::encode(key.sign(payload.as_bytes()).to_bytes());
@@ -577,9 +587,9 @@ mod tests {
     fn macos_signature_platform_and_suffix() {
         let (bytes, key) = signed("0.4.0-alpha.2", |m| {
             m["platform"] = "macos-aarch64".into();
-            m["filename"] = "m4b-Craft-0.4.0-alpha.2-macos-aarch64.dmg".into();
+            m["filename"] = "M4B-Editor-0.4.0-alpha.2-macos-aarch64.dmg".into();
             m["url"] =
-                format!("{REPO}v0.4.0-alpha.2/m4b-Craft-0.4.0-alpha.2-macos-aarch64.dmg").into();
+                format!("{REPO}v0.4.0-alpha.2/M4B-Editor-0.4.0-alpha.2-macos-aarch64.dmg").into();
         });
         assert!(verify_platform(
             &bytes,
@@ -693,6 +703,8 @@ mod tests {
             "https://github.com.evil.test/x",
             "https://evil.test/x",
             "https://github.com/aruel-perso/other/releases/download/a",
+            "https://github.com/aruel-perso/m4b-craft/releases/download/v0.4.0/x",
+            "https://api.github.com/repos/aruel-perso/m4b-editor/releases",
         ] {
             assert!(!allowed_redirect(&Url::parse(url).unwrap()));
         }

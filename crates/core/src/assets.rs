@@ -51,8 +51,10 @@ pub(crate) fn safe_name(name: &str) -> Result<PathBuf> {
 }
 pub(crate) fn audio(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-        ["m4b", "m4a", "mp3", "wav", "flac", "ogg", "opus", "aac"]
-            .contains(&e.to_ascii_lowercase().as_str())
+        [
+            "mka", "mkv", "mp4", "m4b", "m4a", "mp3", "wav", "flac", "ogg", "opus", "aac",
+        ]
+        .contains(&e.to_ascii_lowercase().as_str())
     })
 }
 pub(crate) fn copy_limited(mut input: impl Read, path: &Path, total: &mut u64) -> Result<()> {
@@ -87,6 +89,17 @@ impl Project {
         paths: Vec<PathBuf>,
         assets: &Path,
     ) -> Result<()> {
+        self.import_assets_with(backend, paths, assets, &Job::default(), None)
+    }
+    pub fn import_assets_with(
+        &mut self,
+        backend: &dyn MediaBackend,
+        paths: Vec<PathBuf>,
+        assets: &Path,
+        job: &Job,
+        password: Option<&str>,
+    ) -> Result<()> {
+        job.check()?;
         ensure!(!paths.is_empty(), "Select at least one file");
         fs::create_dir_all(assets).context("Create project asset directory")?;
         let assets = dunce::canonicalize(assets)?;
@@ -97,6 +110,11 @@ impl Project {
         let mut total = 0;
         let mut count: usize = 0;
         for (index, source) in paths.iter().enumerate() {
+            job.check()?;
+            ensure!(
+                fs::metadata(source)?.is_file(),
+                "Import source must be a regular file"
+            );
             let ext = source
                 .extension()
                 .unwrap_or_default()
@@ -104,9 +122,11 @@ impl Project {
                 .to_ascii_lowercase();
             let root = stage.path().join(index.to_string());
             fs::create_dir(&root)?;
-            if ["rar", "7z"].contains(&ext.as_str()) {
-                media.extend(crate::sevenzip::extract(
-                    source, &root, &mut total, &mut count,
+            if ["rar", "7z"].contains(&ext.as_str())
+                || (ext == "zip" && (password.is_some() || zip_needs_external(source)?))
+            {
+                media.extend(crate::sevenzip::extract_options(
+                    source, &root, &mut total, &mut count, job, password,
                 )?);
             } else if ext == "zip" {
                 let mut zip = zip::ZipArchive::new(fs::File::open(source)?)
@@ -165,8 +185,15 @@ impl Project {
                         continue;
                     }
                     fs::create_dir_all(dest.parent().context("ZIP parent")?)?;
-                    copy_limited(&mut entry, &dest, &mut total)
-                        .with_context(|| format!("Extract {}", entry.name()))?;
+                    copy_limited(
+                        CheckedRead {
+                            input: &mut entry,
+                            job,
+                        },
+                        &dest,
+                        &mut total,
+                    )
+                    .with_context(|| format!("Extract {}", entry.name()))?;
                     media.push(dest);
                 }
             } else {
@@ -174,13 +201,21 @@ impl Project {
                 count += 1;
                 ensure!(count <= MAX_FILES, "Import exceeds 4096 files");
                 let dest = root.join(source.file_name().context("Missing filename")?);
-                copy_limited(fs::File::open(source)?, &dest, &mut total)?;
+                copy_limited(
+                    CheckedRead {
+                        input: fs::File::open(source)?,
+                        job,
+                    },
+                    &dest,
+                    &mut total,
+                )?;
                 media.push(dest);
             }
         }
         ensure!(!media.is_empty(), "Archive contains no audio files");
         let mut next = self.clone();
-        next.import(backend, media)?;
+        next.import_with_job(backend, media, job)?;
+        job.check()?;
         // Persist the successful batch with a unique name, preserving prior batches.
         let old = stage.path().to_path_buf();
         let committed = stage.keep();
@@ -246,6 +281,7 @@ mod archive_tests {
                     codec: "test".into(),
                     sample_rate: 48000,
                     channels: 2,
+                    stream_index: None,
                 },
                 metadata: Metadata::default(),
                 chapters: vec![],
@@ -385,17 +421,19 @@ mod archive_tests {
     #[test]
     fn real_sevenzip_import_order_and_rollback() {
         // This is an integration test of the installed executable, not a synthetic 7z fixture.
-        let exe = Path::new("/usr/bin/7z");
-        if !exe.is_file() {
-            eprintln!("SKIP: /usr/bin/7z unavailable");
-            return;
-        }
+        let exe = match crate::discover_archiver() {
+            Ok(exe) => exe,
+            Err(error) => {
+                eprintln!("SKIP optional archiver integration: {error}");
+                return;
+            }
+        };
         let dir = tempfile::tempdir().unwrap();
         for name in ["track10.mp3", "track2.mp3", "-switch.mp3"] {
             fs::write(dir.path().join(name), b"audio").unwrap();
         }
         let zip = dir.path().join("book.7z");
-        assert!(std::process::Command::new(exe)
+        assert!(std::process::Command::new(&exe)
             .current_dir(dir.path())
             .args(["a", "-bd", "-spd", "--"])
             .arg(&zip)
@@ -419,7 +457,7 @@ mod archive_tests {
             .import_assets(&Backend, vec![zip.clone()], &assets)
             .is_err());
         fs::remove_file(&zip).unwrap();
-        assert!(std::process::Command::new(exe)
+        assert!(std::process::Command::new(&exe)
             .current_dir(dir.path())
             .args(["a", "-bd", "-psecret", "--"])
             .arg(&zip)
@@ -433,7 +471,7 @@ mod archive_tests {
             .is_err());
         fs::remove_file(&zip).unwrap();
         fs::write(dir.path().join("bad.mp3"), b"invalid").unwrap();
-        assert!(std::process::Command::new(exe)
+        assert!(std::process::Command::new(&exe)
             .current_dir(dir.path())
             .args(["a", "-bd", "--"])
             .arg(&zip)
@@ -514,4 +552,37 @@ mod archive_tests {
         assert!(p.import_assets(&Backend, vec![zip], &assets).is_err());
         assert_eq!(fs::read_dir(&assets).unwrap().count(), 0);
     }
+}
+
+struct CheckedRead<'a, R> {
+    input: R,
+    job: &'a Job,
+}
+impl<R: Read> Read for CheckedRead<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.job.check().map_err(std::io::Error::other)?;
+        self.input.read(buffer)
+    }
+}
+fn zip_needs_external(path: &Path) -> Result<bool> {
+    // The built-in reader intentionally supports only classic unencrypted ZIP.
+    // ZIP64 and encrypted ZIP use the same validated external-member path.
+    use std::io::{Seek, SeekFrom};
+    let mut file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len >= 30 {
+        let mut header = [0; 30];
+        file.read_exact(&mut header)?;
+        if &header[..4] == b"PK\x03\x04"
+            && (header[6] & 1 != 0 || header[18..22] == [255; 4] || header[22..26] == [255; 4])
+        {
+            return Ok(true);
+        }
+    }
+    file.seek(SeekFrom::Start(len.saturating_sub(65557)))?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail)?;
+    Ok(tail
+        .windows(4)
+        .any(|s| s == b"PK\x06\x06" || s == b"PK\x06\x07"))
 }

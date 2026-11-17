@@ -1,22 +1,14 @@
 //! Optional external archiver. Only validated, exact members are streamed to our own files.
-use crate::assets::{audio, copy_limited, safe_name, MAX_BYTES, MAX_FILE, MAX_FILES};
+use crate::assets::{audio, safe_name, MAX_BYTES, MAX_FILE, MAX_FILES};
 use anyhow::{bail, ensure, Context, Result};
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::Read,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
 };
 
-struct Process(Child);
-impl Drop for Process {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-fn discover() -> Result<PathBuf> {
+pub fn discover() -> Result<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(parent) = std::env::current_exe()?.parent() {
         dirs.push(parent.to_path_buf());
@@ -42,8 +34,8 @@ fn discover_in(dirs: impl IntoIterator<Item = PathBuf>) -> Result<PathBuf> {
     bail!("RAR/7Z import requires optional 7z or 7zz. Place the archiver beside the application or on PATH; no archiver is bundled.")
 }
 fn command(exe: &Path, action: &str, source: &Path) -> Command {
-    let mut c = Command::new(exe);
-    c.args([action, "-bd", "-y", "-p", "-spd", "-sccUTF-8"]);
+    let mut c = crate::command(exe);
+    c.args([action, "-bd", "-y", "-spd", "-sccUTF-8"]);
     if action == "l" {
         c.args(["-slt", "-ba"]);
     } else {
@@ -62,7 +54,11 @@ struct Member {
     size: u64,
     directory: bool,
 }
+#[cfg(test)]
 fn listing(text: &str) -> Result<Vec<Member>> {
+    listing_password(text, false)
+}
+fn listing_password(text: &str, password: bool) -> Result<Vec<Member>> {
     let mut members = Vec::new();
     let mut seen = HashSet::new();
     let mut total = 0u64;
@@ -98,7 +94,8 @@ fn listing(text: &str) -> Result<Vec<Member>> {
             "Archive special file forbidden"
         );
         ensure!(
-            fields.get("Encrypted") == Some(&"-"),
+            fields.get("Encrypted") == Some(&"-")
+                || (password && fields.get("Encrypted") == Some(&"+")),
             "Encrypted or unknown encryption state unsupported"
         );
         let directory = fields.get("Folder") == Some(&"+") || attributes.starts_with('D');
@@ -144,15 +141,18 @@ fn listing(text: &str) -> Result<Vec<Member>> {
     }
     Ok(members)
 }
-pub(crate) fn extract(
+pub(crate) fn extract_options(
     source: &Path,
     root: &Path,
     total: &mut u64,
     count: &mut usize,
+    job: &crate::Job,
+    password: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
     let exe = discover()?;
-    extract_with(&exe, source, root, total, count)
+    extract_with_options(&exe, source, root, total, count, job, password)
 }
+#[cfg(test)]
 fn extract_with(
     exe: &Path,
     source: &Path,
@@ -160,30 +160,47 @@ fn extract_with(
     total: &mut u64,
     count: &mut usize,
 ) -> Result<Vec<PathBuf>> {
+    extract_with_options(
+        exe,
+        source,
+        root,
+        total,
+        count,
+        &crate::Job::default(),
+        None,
+    )
+}
+fn extract_with_options(
+    exe: &Path,
+    source: &Path,
+    root: &Path,
+    total: &mut u64,
+    count: &mut usize,
+    job: &crate::Job,
+    password: Option<&str>,
+) -> Result<Vec<PathBuf>> {
+    if let Some(password) = password {
+        ensure!(
+            !password.contains(['\n', '\r', '\0']),
+            "Invalid archive password"
+        );
+    }
     let source = dunce::canonicalize(source).context("Open archive")?;
-    let mut child = Process(
-        command(exe, "l", &source)
-            .spawn()
-            .context("Start optional 7z/7zz archiver")?,
-    );
-    let mut bytes = Vec::new();
-    child
-        .0
-        .stdout
-        .take()
-        .context("Archiver stdout")?
-        .take(16 * 1024 * 1024 + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() <= 16 * 1024 * 1024,
-        "Archive listing exceeds limit"
-    );
-    ensure!(
-        child.0.wait()?.success(),
-        "Archiver listing failed (corrupt, encrypted or unsupported archive)"
-    );
+    let listing_file = root.join(".listing");
+    crate::jobs::stream_file(
+        &mut command(exe, "l", &source),
+        job,
+        &listing_file,
+        16 * 1024 * 1024,
+        password,
+    )?;
+    let bytes = fs::read(&listing_file)?;
+    fs::remove_file(&listing_file)?;
     let text = String::from_utf8(bytes)?.replace("\r\n", "\n");
-    let members = listing(&text)?;
+    let text = text
+        .strip_prefix("\nEnter password (will not be echoed):\n")
+        .unwrap_or(&text);
+    let members = listing_password(text, password.is_some())?;
     *count = count
         .checked_add(members.len())
         .context("Entry count overflow")?;
@@ -192,6 +209,10 @@ fn extract_with(
     ensure!(
         declared <= MAX_BYTES.saturating_sub(*total),
         "Batch exceeds expanded limit"
+    );
+    ensure!(
+        crate::available_space(root)? >= declared.saturating_add(1024 * 1024),
+        "Insufficient disk space for archive import"
     );
     let mut paths = Vec::new();
     for (i, member) in members.iter().enumerate().filter(|(_, m)| !m.directory) {
@@ -205,26 +226,9 @@ fn extract_with(
         );
         let mut c = command(exe, "x", &source);
         c.arg(&member.name);
-        let mut child = Process(c.spawn().context("Start member stream")?);
-        let before = *total;
-        copy_limited(
-            child
-                .0
-                .stdout
-                .take()
-                .context("Member stdout")?
-                .take(member.size + 1),
-            &dest,
-            total,
-        )?;
-        ensure!(
-            *total - before == member.size,
-            "Archive member size mismatch"
-        );
-        ensure!(
-            child.0.wait()?.success(),
-            "Archive member extraction failed"
-        );
+        let size = crate::jobs::stream_file(&mut c, job, &dest, member.size, password)?;
+        ensure!(size == member.size, "Archive member size mismatch");
+        *total = total.checked_add(size).context("Archive size overflow")?;
         paths.push(dest);
     }
     Ok(paths)

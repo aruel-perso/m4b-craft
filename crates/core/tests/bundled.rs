@@ -1,4 +1,4 @@
-use m4b_core::DesktopFfmpeg;
+use m4b_editor_core::DesktopFfmpeg;
 
 #[test]
 fn bundled_tools_are_preferred_by_absolute_executable_directory() {

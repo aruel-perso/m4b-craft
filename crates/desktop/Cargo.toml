@@ -1,10 +1,10 @@
 [package]
-name = "m4b-desktop"
+name = "m4b-editor-desktop"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 [dependencies]
-m4b-core = { path = "../core" }
+m4b-editor-core = { path = "../core" }
 anyhow.workspace = true
 eframe = "0.29"
 rfd = "0.15"
@@ -19,3 +19,10 @@ semver = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[[bin]]
+name = "m4b-editor"
+path = "src/main.rs"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

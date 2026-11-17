@@ -1,5 +1,11 @@
 mod assets;
+mod jobs;
+mod mp4;
+pub use jobs::{available_space, preflight, required_export_bytes, Job};
+mod project;
+pub use project::{ExportFormat, ProjectBaseline};
 mod sevenzip;
+pub use sevenzip::discover as discover_archiver;
 mod zip;
 // Portable project model and media contracts. Only `DesktopFfmpeg` spawns processes.
 use anyhow::{bail, ensure, Context, Result};
@@ -27,6 +33,8 @@ pub struct Metadata {
     pub genre: String,
     pub date: String,
     pub copyright: String,
+    pub publisher: String,
+    pub book_language: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Track {
@@ -35,6 +43,9 @@ pub struct Track {
     pub codec: String,
     pub sample_rate: u32,
     pub channels: u32,
+    /// Absolute FFmpeg stream index; None selects the first audio stream in legacy projects.
+    #[serde(default)]
+    pub stream_index: Option<u32>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Chapter {
@@ -43,6 +54,8 @@ pub struct Chapter {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
+    #[serde(default)]
+    pub format: ExportFormat,
     pub language: String,
     pub theme: String,
     pub bitrate_kbps: u32,
@@ -55,6 +68,7 @@ fn default_remux() -> bool {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            format: ExportFormat::M4b,
             language: "en".into(),
             theme: "system".into(),
             bitrate_kbps: 160,
@@ -102,6 +116,9 @@ impl Project {
             .fold(0u64, |sum, t| sum.saturating_add(t.duration_ms))
     }
     pub fn estimated_bytes(&self) -> u64 {
+        if self.settings.format == ExportFormat::Flac {
+            return self.duration_ms().saturating_mul(192);
+        }
         self.duration_ms()
             .saturating_mul(u64::from(self.settings.bitrate_kbps))
             / 8
@@ -126,7 +143,17 @@ impl Project {
             })
             .collect();
     }
-    pub fn import(&mut self, backend: &dyn MediaBackend, mut paths: Vec<PathBuf>) -> Result<()> {
+    pub fn import(&mut self, backend: &dyn MediaBackend, paths: Vec<PathBuf>) -> Result<()> {
+        self.import_with_job(backend, paths, &Job::default())
+    }
+    pub fn import_with_job(
+        &mut self,
+        backend: &dyn MediaBackend,
+        mut paths: Vec<PathBuf>,
+        job: &Job,
+    ) -> Result<()> {
+        job.check()?;
+        self.chapter_anchors()?;
         paths.sort_by(|a, b| {
             natural_cmp(
                 &a.file_name().unwrap_or(a.as_os_str()).to_string_lossy(),
@@ -137,17 +164,28 @@ impl Project {
         // Probe all before mutating the project, so failed batches are transactional.
         let tracks: Result<Vec<_>> = paths
             .iter()
-            .map(|p| backend.probe(p).map(|v| v.track))
+            .map(|p| backend.probe_with_job(p, job).map(|v| v.track))
             .collect();
         let tracks = tracks?;
-        if self.tracks.is_empty()
-            && paths.len() == 1
-            && paths[0]
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("m4b") || e.eq_ignore_ascii_case("m4a"))
-        {
-            let info = backend.probe(&paths[0])?;
-            self.metadata = info.metadata;
+        if self.tracks.is_empty() && paths.len() == 1 {
+            let info = backend.probe_with_job(&paths[0], job)?;
+            let mut metadata = info.metadata;
+            for (field, old) in [
+                (&mut metadata.title, &self.metadata.title),
+                (&mut metadata.author, &self.metadata.author),
+                (&mut metadata.narrator, &self.metadata.narrator),
+                (&mut metadata.description, &self.metadata.description),
+                (&mut metadata.genre, &self.metadata.genre),
+                (&mut metadata.date, &self.metadata.date),
+                (&mut metadata.copyright, &self.metadata.copyright),
+                (&mut metadata.publisher, &self.metadata.publisher),
+                (&mut metadata.book_language, &self.metadata.book_language),
+            ] {
+                if field.is_empty() {
+                    *field = old.clone();
+                }
+            }
+            self.metadata = metadata;
             self.chapters = info.chapters;
             if info.has_cover {
                 self.cover = Some(info.track.path.clone());
@@ -158,8 +196,22 @@ impl Project {
             }
             return Ok(());
         }
-        self.tracks.extend(tracks);
-        self.reset_chapters();
+        let mut start = self.duration_ms();
+        for track in tracks {
+            self.chapters.push(Chapter {
+                start_ms: start,
+                title: track
+                    .path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            });
+            start = start
+                .checked_add(track.duration_ms)
+                .context("Duration overflow")?;
+            self.tracks.push(track);
+        }
         Ok(())
     }
     pub fn validate(&self) -> Result<()> {
@@ -169,6 +221,16 @@ impl Project {
             self.version
         );
         ensure!(!self.tracks.is_empty(), "No audio tracks");
+        ensure!(
+            self.metadata.book_language.is_empty()
+                || (self.metadata.book_language.len() == 3
+                    && self
+                        .metadata
+                        .book_language
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase())),
+            "Book language must be a lowercase ISO 639-2 code (for example fra or eng)"
+        );
         ensure!(
             self.tracks
                 .iter()
@@ -208,7 +270,8 @@ impl Project {
         Ok(())
     }
     pub fn can_remux(&self) -> bool {
-        self.settings.lossless_remux
+        self.settings.format == ExportFormat::M4b
+            && self.settings.lossless_remux
             && self.tracks.len() == 1
             && self.tracks[0].codec == "aac"
             && self.tracks[0]
@@ -245,7 +308,10 @@ impl Project {
         Ok(())
     }
     pub fn load(path: &Path) -> Result<Self> {
-        let mut p: Self = serde_json::from_reader(fs::File::open(path)?)?;
+        Self::load_bytes(path, &fs::read(path)?)
+    }
+    fn load_bytes(path: &Path, bytes: &[u8]) -> Result<Self> {
+        let mut p: Self = serde_json::from_slice(bytes)?;
         ensure!(p.version == 1, "Unsupported project version");
         let base = dunce::canonicalize(path)?
             .parent()
@@ -308,6 +374,14 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
     }
     (a.len() - i).cmp(&(b.len() - j)).then_with(|| a.cmp(b))
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AudioStream {
+    pub index: u32,
+    pub codec: String,
+    pub sample_rate: u32,
+    pub channels: u32,
+    pub language: String,
+}
 #[derive(Clone, Debug)]
 pub struct Probe {
     pub track: Track,
@@ -323,6 +397,12 @@ pub enum ExportEvent {
 pub type Cancel = Arc<AtomicBool>;
 pub trait MediaBackend: Send + Sync {
     fn probe(&self, path: &Path) -> Result<Probe>;
+    fn probe_with_job(&self, path: &Path, job: &Job) -> Result<Probe> {
+        job.check()?;
+        let result = self.probe(path)?;
+        job.check()?;
+        Ok(result)
+    }
     fn encoders(&self) -> Result<Vec<String>>;
     fn export(
         &self,
@@ -336,6 +416,7 @@ pub trait MediaBackend: Send + Sync {
 pub struct DesktopFfmpeg {
     pub ffmpeg: PathBuf,
     pub ffprobe: PathBuf,
+    pub job: Job,
 }
 impl Default for DesktopFfmpeg {
     fn default() -> Self {
@@ -365,6 +446,7 @@ impl DesktopFfmpeg {
         Self {
             ffmpeg: locate(directory, "ffmpeg"),
             ffprobe: locate(directory, "ffprobe"),
+            job: Job::default(),
         }
     }
 }
@@ -400,44 +482,52 @@ impl DesktopFfmpeg {
     /// Small preview extracted off the UI thread; one scaled frame only.
     pub fn extract_cover_preview(&self, input: &Path, output: &Path) -> Result<()> {
         ensure!(!output.exists(), "Cover destination exists");
-        let status = command(&self.ffmpeg)
-            .args([
-                "-v",
-                "error",
-                "-nostdin",
-                "-n",
-                "-threads",
-                "1",
-                "-max_alloc",
-                "67108864",
-                "-i",
-            ])
-            .arg(input)
-            .args([
-                "-map",
-                "0:v:0",
-                "-frames:v",
-                "1",
-                "-vf",
-                "scale=560:560:force_original_aspect_ratio=decrease",
-                "-threads",
-                "1",
-                "-fs",
-                "16777216",
-            ])
-            .arg(output)
-            .status()?;
+        let status = jobs::capture(
+            command(&self.ffmpeg)
+                .args([
+                    "-v",
+                    "error",
+                    "-nostdin",
+                    "-n",
+                    "-threads",
+                    "1",
+                    "-max_alloc",
+                    "67108864",
+                    "-i",
+                ])
+                .arg(input)
+                .args([
+                    "-map",
+                    "0:v:0",
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    "scale=560:560:force_original_aspect_ratio=decrease",
+                    "-threads",
+                    "1",
+                    "-fs",
+                    "16777216",
+                ])
+                .arg(output),
+            &self.job,
+            65536,
+        )?
+        .status;
         ensure!(status.success(), "Cover extraction failed");
         Ok(())
     }
     pub fn extract_cover(&self, input: &Path, output: &Path) -> Result<()> {
         ensure!(!output.exists(), "Cover destination exists");
-        let s = command(&self.ffmpeg)
-            .args(["-v", "error", "-nostdin", "-n", "-i"])
-            .arg(input)
-            .args(["-map", "0:v:0", "-frames:v", "1"])
-            .arg(output)
-            .status()?;
+        let s = jobs::capture(
+            command(&self.ffmpeg)
+                .args(["-v", "error", "-nostdin", "-n", "-i"])
+                .arg(input)
+                .args(["-map", "0:v:0", "-frames:v", "1"])
+                .arg(output),
+            &self.job,
+            65536,
+        )?
+        .status;
         ensure!(s.success(), "Cover extraction failed");
         Ok(())
     }
@@ -461,6 +551,8 @@ impl DesktopFfmpeg {
                 "warning",
                 "-threads",
                 "1",
+                "-max_alloc",
+                "67108864",
                 "-filter_threads",
                 "1",
                 "-filter_complex_threads",
@@ -474,27 +566,28 @@ impl DesktopFfmpeg {
             .stderr(Stdio::piped())
             .spawn()
             .context("Start ffmpeg (install it or configure its path)")?;
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(128);
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         let tx2 = tx.clone();
         let out_thread = std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(|line| line.ok()) {
+            for line in bounded_lines(stdout) {
                 if tx.send((true, line)).is_err() {
                     break;
                 }
             }
         });
         let err_thread = std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(|line| line.ok()) {
+            for line in bounded_lines(stderr) {
                 if tx2.send((false, line)).is_err() {
                     break;
                 }
             }
         });
         let mut last_errors = String::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(24 * 3600);
         let result = loop {
-            for (progress, line) in rx.try_iter() {
+            for (progress, line) in rx.try_iter().take(256) {
                 if progress {
                     if let Some(t) = line
                         .strip_prefix("out_time_us=")
@@ -513,19 +606,22 @@ impl DesktopFfmpeg {
                     event(ExportEvent::Log(line));
                 }
             }
-            if cancel.load(AtomicOrdering::Relaxed) {
+            let stop = if cancel.load(AtomicOrdering::Relaxed) {
+                Some(anyhow::anyhow!("Export cancelled"))
+            } else if let Err(e) = self.job.check() {
+                Some(e)
+            } else if std::time::Instant::now() >= deadline {
+                Some(anyhow::anyhow!("Encoder deadline exceeded"))
+            } else {
+                None
+            };
+            if let Some(error) = stop {
                 let _ = child.kill();
                 let _ = child.wait();
-                break Err(anyhow::anyhow!("Export cancelled"));
+                break Err(error);
             }
             match child.try_wait() {
-                Ok(Some(s)) => {
-                    break if s.success() {
-                        Ok(())
-                    } else {
-                        Err(anyhow::anyhow!("FFmpeg failed ({s}): {last_errors}"))
-                    };
-                }
+                Ok(Some(status)) => break Ok(status),
                 Ok(None) => std::thread::sleep(Duration::from_millis(40)),
                 Err(e) => {
                     let _ = child.kill();
@@ -534,21 +630,93 @@ impl DesktopFfmpeg {
                 }
             }
         };
+        while !out_thread.is_finished() || !err_thread.is_finished() {
+            for (progress, line) in rx.try_iter().take(256) {
+                if !progress {
+                    if last_errors.len() < 16384 {
+                        last_errors.push_str(&line);
+                        last_errors.push('\n');
+                    }
+                    event(ExportEvent::Log(line));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let _ = out_thread.join();
         let _ = err_thread.join();
-        for (progress, line) in rx.try_iter() {
+        for (progress, line) in rx.try_iter().take(256) {
             if !progress {
+                if last_errors.len() < 16384 {
+                    last_errors.push_str(&line);
+                    last_errors.push('\n');
+                }
                 event(ExportEvent::Log(line));
             }
         }
-        result
+        let status = result?;
+        ensure!(status.success(), "FFmpeg failed ({status}): {last_errors}");
+        Ok(())
     }
 }
+fn bounded_lines(input: impl std::io::Read) -> impl Iterator<Item = String> {
+    let mut reader = BufReader::new(input);
+    std::iter::from_fn(move || {
+        let mut line = Vec::new();
+        use std::io::Read;
+        match reader.by_ref().take(16384).read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(
+                String::from_utf8_lossy(&line)
+                    .trim_end_matches(['\r', '\n'])
+                    .to_owned(),
+            ),
+        }
+    })
+}
 fn tag(v: &serde_json::Value, key: &str) -> String {
-    v.get(key)
-        .and_then(|v| v.as_str())
+    v.as_object()
+        .and_then(|object| {
+            object
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                .and_then(|(_, v)| v.as_str())
+        })
         .unwrap_or_default()
         .into()
+}
+fn vorbis_chapters(tags: &serde_json::Value) -> Vec<Chapter> {
+    let mut chapters = Vec::new();
+    for index in 1..=4096 {
+        let key = format!("CHAPTER{index:03}");
+        let start = tag(tags, &key);
+        if start.is_empty() {
+            break;
+        }
+        let parts: Vec<_> = start.split(':').collect();
+        if parts.len() != 3 {
+            return Vec::new();
+        }
+        let parse = || -> Option<u64> {
+            let hours = parts[0].parse::<u64>().ok()?;
+            let minutes = parts[1].parse::<u64>().ok()?;
+            let seconds = parts[2].parse::<f64>().ok()?;
+            if minutes >= 60 || !seconds.is_finite() || !(0.0..60.0).contains(&seconds) {
+                return None;
+            }
+            hours
+                .checked_mul(3600000)?
+                .checked_add(minutes * 60000)?
+                .checked_add((seconds * 1000.).round() as u64)
+        };
+        let Some(start_ms) = parse() else {
+            return Vec::new();
+        };
+        chapters.push(Chapter {
+            start_ms,
+            title: tag(tags, &format!("{key}NAME")),
+        });
+    }
+    chapters
 }
 fn meta_escape(s: &str) -> String {
     s.replace('\\', "\\\\")
@@ -558,33 +726,58 @@ fn meta_escape(s: &str) -> String {
         .replace('\r', "")
         .replace('\n', "\\\n")
 }
-impl MediaBackend for DesktopFfmpeg {
-    fn probe(&self, path: &Path) -> Result<Probe> {
+impl DesktopFfmpeg {
+    fn probe_document(&self, path: &Path) -> Result<(PathBuf, serde_json::Value)> {
         let path =
             dunce::canonicalize(path).with_context(|| format!("Read source {}", path.display()))?;
-        let o = command(&self.ffprobe)
-            .args([
-                "-v",
-                "error",
-                "-show_format",
-                "-show_streams",
-                "-show_chapters",
-                "-of",
-                "json",
-            ])
-            .arg(&path)
-            .output()
-            .context("Start ffprobe")?;
+        let o = jobs::capture(
+            command(&self.ffprobe)
+                .args([
+                    "-v",
+                    "error",
+                    "-show_format",
+                    "-show_streams",
+                    "-show_chapters",
+                    "-of",
+                    "json",
+                ])
+                .arg(&path),
+            &self.job,
+            16 * 1024 * 1024,
+        )?;
         ensure!(
             o.status.success(),
             "ffprobe: {}",
             String::from_utf8_lossy(&o.stderr)
         );
         let v: serde_json::Value = serde_json::from_slice(&o.stdout)?;
+        Ok((path, v))
+    }
+    pub fn audio_streams(&self, path: &Path) -> Result<Vec<AudioStream>> {
+        let (_, v) = self.probe_document(path)?;
+        Ok(v["streams"]
+            .as_array()
+            .context("No streams")?
+            .iter()
+            .filter(|s| s["codec_type"] == "audio")
+            .map(|s| AudioStream {
+                index: s["index"].as_u64().unwrap_or(0) as u32,
+                codec: tag(s, "codec_name"),
+                sample_rate: tag(s, "sample_rate").parse().unwrap_or(0),
+                channels: s["channels"].as_u64().unwrap_or(0) as u32,
+                language: tag(&s["tags"], "language"),
+            })
+            .collect())
+    }
+    pub fn probe_stream(&self, path: &Path, stream_index: Option<u32>) -> Result<Probe> {
+        let (path, v) = self.probe_document(path)?;
         let streams = v["streams"].as_array().context("No streams")?;
         let audio = streams
             .iter()
-            .find(|s| s["codec_type"] == "audio")
+            .find(|s| {
+                s["codec_type"] == "audio"
+                    && stream_index.is_none_or(|i| s["index"].as_u64() == Some(u64::from(i)))
+            })
             .context("No audio stream")?;
         let duration = audio["duration"]
             .as_str()
@@ -596,7 +789,7 @@ impl MediaBackend for DesktopFfmpeg {
             "Invalid duration"
         );
         let tags = &v["format"]["tags"];
-        let chapters = v["chapters"]
+        let mut chapters: Vec<Chapter> = v["chapters"]
             .as_array()
             .map(|cs| {
                 cs.iter()
@@ -613,6 +806,9 @@ impl MediaBackend for DesktopFfmpeg {
                     .collect()
             })
             .unwrap_or_default();
+        if chapters.is_empty() {
+            chapters = vorbis_chapters(tags);
+        }
         Ok(Probe {
             track: Track {
                 path,
@@ -620,15 +816,34 @@ impl MediaBackend for DesktopFfmpeg {
                 codec: tag(audio, "codec_name"),
                 sample_rate: tag(audio, "sample_rate").parse().unwrap_or(0),
                 channels: audio["channels"].as_u64().unwrap_or(0) as u32,
+                stream_index: audio["index"].as_u64().map(|v| v as u32),
             },
             metadata: Metadata {
                 title: tag(tags, "title"),
                 author: tag(tags, "artist"),
                 narrator: tag(tags, "composer"),
-                description: tag(tags, "description"),
+                description: {
+                    let description = tag(tags, "description");
+                    if description.is_empty() {
+                        tag(tags, "comment")
+                    } else {
+                        description
+                    }
+                },
                 genre: tag(tags, "genre"),
                 date: tag(tags, "date"),
                 copyright: tag(tags, "copyright"),
+                publisher: tag(tags, "publisher"),
+                book_language: {
+                    let language = tag(&audio["tags"], "language");
+                    if language.is_empty()
+                        || (language == "und" && !tag(tags, "language").is_empty())
+                    {
+                        tag(tags, "language")
+                    } else {
+                        language
+                    }
+                },
             },
             chapters,
             has_cover: streams
@@ -636,10 +851,22 @@ impl MediaBackend for DesktopFfmpeg {
                 .any(|s| s["disposition"]["attached_pic"] == 1),
         })
     }
+}
+impl MediaBackend for DesktopFfmpeg {
+    fn probe_with_job(&self, path: &Path, job: &Job) -> Result<Probe> {
+        let mut backend = self.clone();
+        backend.job = job.clone();
+        backend.probe(path)
+    }
+    fn probe(&self, path: &Path) -> Result<Probe> {
+        self.probe_stream(path, None)
+    }
     fn encoders(&self) -> Result<Vec<String>> {
-        let o = command(&self.ffmpeg)
-            .args(["-hide_banner", "-encoders"])
-            .output()?;
+        let o = jobs::capture(
+            command(&self.ffmpeg).args(["-hide_banner", "-encoders"]),
+            &self.job,
+            4 * 1024 * 1024,
+        )?;
         ensure!(o.status.success(), "Cannot query encoders");
         Ok(String::from_utf8_lossy(&o.stdout)
             .lines()
@@ -657,11 +884,28 @@ impl MediaBackend for DesktopFfmpeg {
     }
     fn export(
         &self,
+        project: &Project,
+        output: &Path,
+        cancel: Cancel,
+        event: &mut dyn FnMut(ExportEvent),
+    ) -> Result<()> {
+        let mut backend = self.clone();
+        backend.job.cancel = cancel.clone();
+        if backend.job.deadline.is_none() {
+            backend.job.deadline = Some(std::time::Instant::now() + Duration::from_secs(86400));
+        }
+        backend.export_impl(project, output, cancel, event)
+    }
+}
+impl DesktopFfmpeg {
+    fn export_impl(
+        &self,
         p: &Project,
         output: &Path,
         cancel: Cancel,
         event: &mut dyn FnMut(ExportEvent),
     ) -> Result<()> {
+        self.job.check()?;
         p.validate()?;
         ensure!(
             !output.exists(),
@@ -670,25 +914,28 @@ impl MediaBackend for DesktopFfmpeg {
         ensure!(
             output
                 .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("m4b")),
-            "Output must have .m4b extension"
+                .is_some_and(|e| e.eq_ignore_ascii_case(p.settings.format.extension())),
+            "Output extension must match selected format"
         );
         let remux = p.can_remux();
         if !remux {
             ensure!(
-                self.encoders()?.iter().any(|e| e == "aac"),
-                "This FFmpeg lacks the AAC encoder"
+                self.encoders()?
+                    .iter()
+                    .any(|e| e == p.settings.format.encoder()),
+                "This FFmpeg lacks the selected encoder"
             );
         }
         let parent = dunce::canonicalize(parent_dir(output))?;
         let output = parent.join(output.file_name().context("Invalid output")?);
+        preflight(p, &parent)?;
         // Same filesystem as destination: hard-link publishes atomically with no replace.
         let stage = tempfile::Builder::new()
-            .prefix(".m4b-craft-")
+            .prefix(".m4b-editor-")
             .tempdir_in(&parent)?;
         let mut total = 0u64;
         for t in &p.tracks {
-            let fresh = self.probe(&t.path)?.track;
+            let fresh = self.probe_stream(&t.path, t.stream_index)?.track;
             ensure!(
                 fresh.duration_ms.abs_diff(t.duration_ms) <= 100,
                 "Source duration changed; reimport {}",
@@ -719,7 +966,10 @@ impl MediaBackend for DesktopFfmpeg {
                     "-i".into(),
                     t.path.as_os_str().into(),
                     "-map".into(),
-                    "0:a:0".into(),
+                    t.stream_index
+                        .map(|i| format!("0:{i}"))
+                        .unwrap_or_else(|| "0:a:0".into())
+                        .into(),
                     "-vn".into(),
                     "-ar".into(),
                     "48000".into(),
@@ -786,9 +1036,26 @@ impl MediaBackend for DesktopFfmpeg {
             ("genre", &p.metadata.genre),
             ("date", &p.metadata.date),
             ("copyright", &p.metadata.copyright),
+            ("publisher", &p.metadata.publisher),
+            ("language", &p.metadata.book_language),
             ("album", &p.metadata.title),
         ] {
             meta.push_str(&format!("{key}={}\n", meta_escape(val)));
+        }
+        if p.settings.format == ExportFormat::Flac {
+            for (i, c) in export_chapters.iter().enumerate() {
+                let ms = c.start_ms;
+                meta.push_str(&format!(
+                    "CHAPTER{:03}={:02}:{:02}:{:02}.{:03}\nCHAPTER{:03}NAME={}\n",
+                    i + 1,
+                    ms / 3600000,
+                    ms / 60000 % 60,
+                    ms / 1000 % 60,
+                    ms % 1000,
+                    i + 1,
+                    meta_escape(&c.title)
+                ));
+            }
         }
         for (i, c) in export_chapters.iter().enumerate() {
             let end = export_chapters
@@ -803,7 +1070,9 @@ impl MediaBackend for DesktopFfmpeg {
         }
         let metadata = stage.path().join("metadata.txt");
         fs::write(&metadata, meta)?;
-        let temp = stage.path().join("output.m4b");
+        let temp = stage
+            .path()
+            .join(format!("output.{}", p.settings.format.extension()));
         let mut args: Vec<std::ffi::OsString> = if remux {
             vec![
                 "-n".into(),
@@ -832,14 +1101,30 @@ impl MediaBackend for DesktopFfmpeg {
         }
         args.extend([
             "-map".into(),
-            "0:a:0".into(),
+            if remux {
+                p.tracks[0]
+                    .stream_index
+                    .map(|i| format!("0:{i}"))
+                    .unwrap_or_else(|| "0:a:0".into())
+            } else {
+                "0:a:0".into()
+            }
+            .into(),
             "-map_metadata".into(),
             "1".into(),
             "-map_chapters".into(),
             "1".into(),
         ]);
-        args.extend(["-c:a".into(), if remux { "copy" } else { "aac" }.into()]);
-        if !remux {
+        args.extend([
+            "-c:a".into(),
+            if remux {
+                "copy"
+            } else {
+                p.settings.format.encoder()
+            }
+            .into(),
+        ]);
+        if !remux && p.settings.format != ExportFormat::Flac {
             args.extend([
                 "-b:a".into(),
                 format!("{}k", p.settings.bitrate_kbps).into(),
@@ -860,44 +1145,84 @@ impl MediaBackend for DesktopFfmpeg {
             "1".into(),
             "-threads:v".into(),
             "1".into(),
-            "-movflags".into(),
-            "+faststart".into(),
-            "-f".into(),
-            "ipod".into(),
-            temp.as_os_str().into(),
         ]);
+        if !p.metadata.book_language.is_empty() {
+            args.extend([
+                "-metadata:s:a:0".into(),
+                format!("language={}", p.metadata.book_language).into(),
+            ]);
+        }
+        if p.settings.format == ExportFormat::M4b {
+            args.extend(["-f".into(), "ipod".into()]);
+        } else {
+            args.extend(["-f".into(), p.settings.format.extension().into()]);
+        }
+        args.push(temp.as_os_str().into());
         event(ExportEvent::Log(
             if remux {
                 "Lossless AAC remux and chapters"
             } else {
-                "Encoding AAC and chapters"
+                match p.settings.format {
+                    ExportFormat::M4b => "Encoding AAC and chapters",
+                    ExportFormat::Mp3 => "Encoding MP3 and chapters",
+                    ExportFormat::Flac => "Encoding FLAC and chapters",
+                }
             }
             .into(),
         ));
         self.run(&args, &cancel, event, 0.45, 0.50, total)?;
+        if p.settings.format == ExportFormat::M4b {
+            mp4::publisher(&temp, &p.metadata.publisher)?;
+        }
         let check = self.probe(&temp)?;
-        ensure!(check.track.codec == "aac", "Output codec validation failed");
+        ensure!(
+            check.track.codec == p.settings.format.codec(),
+            "Output codec validation failed"
+        );
         ensure!(
             check.track.duration_ms.abs_diff(total) < 500,
             "Output duration validation failed"
         );
+        for (name, actual, expected) in [
+            ("title", &check.metadata.title, &p.metadata.title),
+            ("author", &check.metadata.author, &p.metadata.author),
+            ("narrator", &check.metadata.narrator, &p.metadata.narrator),
+            (
+                "description",
+                &check.metadata.description,
+                &p.metadata.description,
+            ),
+            ("genre", &check.metadata.genre, &p.metadata.genre),
+            ("date", &check.metadata.date, &p.metadata.date),
+            (
+                "copyright",
+                &check.metadata.copyright,
+                &p.metadata.copyright,
+            ),
+            (
+                "publisher",
+                &check.metadata.publisher,
+                &p.metadata.publisher,
+            ),
+        ] {
+            ensure!(
+                actual == expected,
+                "Output {} metadata validation failed: {name}",
+                p.settings.format.extension()
+            );
+        }
         ensure!(
-            check.metadata.title == p.metadata.title
-                && check.metadata.author == p.metadata.author
-                && check.metadata.narrator == p.metadata.narrator
-                && check.metadata.description == p.metadata.description
-                && check.metadata.genre == p.metadata.genre
-                && check.metadata.date == p.metadata.date
-                && check.metadata.copyright == p.metadata.copyright,
-            "Output metadata validation failed"
+            p.metadata.book_language.is_empty()
+                || check.metadata.book_language == p.metadata.book_language,
+            "Output book language validation failed"
         );
         ensure!(
-            check.chapters.len() == export_chapters.len()
+            (check.chapters.len() == export_chapters.len()
                 && check.chapters.iter().zip(&export_chapters).all(|(a, b)| a
                     .start_ms
                     .abs_diff(b.start_ms)
                     <= 2
-                    && a.title == b.title),
+                    && a.title == b.title)),
             "Output chapter validation failed"
         );
         ensure!(
@@ -975,6 +1300,7 @@ mod tests {
             codec: "pcm_s16le".into(),
             sample_rate: 48000,
             channels: 2,
+            stream_index: None,
         });
         p.reset_chapters();
         assert!(p.validate().is_ok());

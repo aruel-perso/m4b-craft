@@ -2302,40 +2302,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
-name = "m4b-cli"
-version = "0.3.0-alpha.1"
+name = "m4b-editor-cli"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
- "m4b-core",
+ "m4b-editor-core",
  "serde_json",
  "tempfile",
 ]
 
 [[package]]
-name = "m4b-core"
-version = "0.3.0-alpha.1"
+name = "m4b-editor-core"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "crc32fast",
  "dunce",
  "flate2",
+ "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
 [[package]]
-name = "m4b-desktop"
-version = "0.3.0-alpha.1"
+name = "m4b-editor-desktop"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
  "eframe",
  "hex",
  "image",
- "m4b-core",
+ "libc",
+ "m4b-editor-core",
  "reqwest",
  "rfd",
  "rodio",

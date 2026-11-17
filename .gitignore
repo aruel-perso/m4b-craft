@@ -12,6 +12,7 @@ __pycache__/
 *.key
 *.token
 *.assets/
+/BRIEF.md
 
 # Versioned synthetic regression media belongs in source distributions.
 !tests/fixtures/**/*.wav
