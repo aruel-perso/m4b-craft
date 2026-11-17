@@ -46,13 +46,19 @@ pub struct Settings {
     pub language: String,
     pub theme: String,
     pub bitrate_kbps: u32,
+    #[serde(default = "default_remux")]
+    pub lossless_remux: bool,
+}
+fn default_remux() -> bool {
+    true
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
             language: "en".into(),
             theme: "system".into(),
-            bitrate_kbps: 96,
+            bitrate_kbps: 160,
+            lossless_remux: true,
         }
     }
 }
@@ -200,6 +206,15 @@ impl Project {
             ensure!(p.is_file(), "Cover does not exist");
         }
         Ok(())
+    }
+    pub fn can_remux(&self) -> bool {
+        self.settings.lossless_remux
+            && self.tracks.len() == 1
+            && self.tracks[0].codec == "aac"
+            && self.tracks[0]
+                .path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("m4b") || e.eq_ignore_ascii_case("m4a"))
     }
     pub fn save(&self, path: &Path) -> Result<()> {
         self.write_project(path, true)
@@ -381,6 +396,39 @@ impl DesktopFfmpeg {
             p.reset_chapters();
         }
         Ok(p)
+    }
+    /// Small preview extracted off the UI thread; one scaled frame only.
+    pub fn extract_cover_preview(&self, input: &Path, output: &Path) -> Result<()> {
+        ensure!(!output.exists(), "Cover destination exists");
+        let status = command(&self.ffmpeg)
+            .args([
+                "-v",
+                "error",
+                "-nostdin",
+                "-n",
+                "-threads",
+                "1",
+                "-max_alloc",
+                "67108864",
+                "-i",
+            ])
+            .arg(input)
+            .args([
+                "-map",
+                "0:v:0",
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=560:560:force_original_aspect_ratio=decrease",
+                "-threads",
+                "1",
+                "-fs",
+                "16777216",
+            ])
+            .arg(output)
+            .status()?;
+        ensure!(status.success(), "Cover extraction failed");
+        Ok(())
     }
     pub fn extract_cover(&self, input: &Path, output: &Path) -> Result<()> {
         ensure!(!output.exists(), "Cover destination exists");
@@ -625,10 +673,13 @@ impl MediaBackend for DesktopFfmpeg {
                 .is_some_and(|e| e.eq_ignore_ascii_case("m4b")),
             "Output must have .m4b extension"
         );
-        ensure!(
-            self.encoders()?.iter().any(|e| e == "aac"),
-            "This FFmpeg lacks the AAC encoder"
-        );
+        let remux = p.can_remux();
+        if !remux {
+            ensure!(
+                self.encoders()?.iter().any(|e| e == "aac"),
+                "This FFmpeg lacks the AAC encoder"
+            );
+        }
         let parent = dunce::canonicalize(parent_dir(output))?;
         let output = parent.join(output.file_name().context("Invalid output")?);
         // Same filesystem as destination: hard-link publishes atomically with no replace.
@@ -643,81 +694,88 @@ impl MediaBackend for DesktopFfmpeg {
                 "Source duration changed; reimport {}",
                 t.path.display()
             );
+            ensure!(
+                !remux || fresh.codec == "aac",
+                "Source codec changed; reimport source"
+            );
             total = total
                 .checked_add(fresh.duration_ms)
                 .context("Duration overflow")?;
         }
-        let mut list = String::new();
-        let mut decoded_durations = Vec::new();
-        let mut elapsed = 0u64;
-        for (i, t) in p.tracks.iter().enumerate() {
-            event(ExportEvent::Log(format!(
-                "Preparing track {}: {}",
-                i + 1,
-                t.path.display()
-            )));
-            let wav = stage.path().join(format!("track{i}.wav"));
-            let args = vec![
-                "-n".into(),
-                "-i".into(),
-                t.path.as_os_str().into(),
-                "-map".into(),
-                "0:a:0".into(),
-                "-vn".into(),
-                "-ar".into(),
-                "48000".into(),
-                "-ac".into(),
-                "2".into(),
-                "-c:a".into(),
-                "pcm_s16le".into(),
-                "-rf64".into(),
-                "auto".into(),
-                wav.as_os_str().into(),
-            ];
-            self.run(
-                &args,
-                &cancel,
-                event,
-                0.45 * elapsed as f32 / total as f32,
-                0.45 * t.duration_ms as f32 / total as f32,
-                t.duration_ms,
-            )?;
-            decoded_durations.push(self.probe(&wav)?.track.duration_ms);
-            list.push_str(&format!("file 'track{i}.wav'\n"));
-            elapsed += t.duration_ms;
-        }
-        // Compressed stream durations can include encoder delay/padding. Use the
-        // decoded samples for the output timeline, retaining chapter offsets
-        // within their source track rather than accumulating padding as gaps.
-        let mut export_chapters = Vec::new();
-        for c in &p.chapters {
-            let (mut source_start, mut decoded_start) = (0u64, 0u64);
-            for (track, decoded) in p.tracks.iter().zip(&decoded_durations) {
-                if c.start_ms < source_start + track.duration_ms {
-                    let offset = c.start_ms - source_start;
-                    ensure!(
-                        offset < *decoded,
-                        "Chapter '{}' lies in discarded source padding; adjust its start",
-                        c.title
-                    );
-                    export_chapters.push(Chapter {
-                        start_ms: decoded_start + offset,
-                        title: c.title.clone(),
-                    });
-                    break;
-                }
-                source_start += track.duration_ms;
-                decoded_start += decoded;
+        let mut export_chapters = p.chapters.clone();
+        if !remux {
+            let mut list = String::new();
+            let mut decoded_durations = Vec::new();
+            let mut elapsed = 0u64;
+            for (i, t) in p.tracks.iter().enumerate() {
+                event(ExportEvent::Log(format!(
+                    "Preparing track {}: {}",
+                    i + 1,
+                    t.path.display()
+                )));
+                let wav = stage.path().join(format!("track{i}.wav"));
+                let args = vec![
+                    "-n".into(),
+                    "-i".into(),
+                    t.path.as_os_str().into(),
+                    "-map".into(),
+                    "0:a:0".into(),
+                    "-vn".into(),
+                    "-ar".into(),
+                    "48000".into(),
+                    "-ac".into(),
+                    "2".into(),
+                    "-c:a".into(),
+                    "pcm_s16le".into(),
+                    "-rf64".into(),
+                    "auto".into(),
+                    wav.as_os_str().into(),
+                ];
+                self.run(
+                    &args,
+                    &cancel,
+                    event,
+                    0.45 * elapsed as f32 / total as f32,
+                    0.45 * t.duration_ms as f32 / total as f32,
+                    t.duration_ms,
+                )?;
+                decoded_durations.push(self.probe(&wav)?.track.duration_ms);
+                list.push_str(&format!("file 'track{i}.wav'\n"));
+                elapsed += t.duration_ms;
             }
+            // Compressed stream durations can include encoder delay/padding. Use the
+            // decoded samples for the output timeline, retaining chapter offsets
+            // within their source track rather than accumulating padding as gaps.
+            export_chapters.clear();
+            for c in &p.chapters {
+                let (mut source_start, mut decoded_start) = (0u64, 0u64);
+                for (track, decoded) in p.tracks.iter().zip(&decoded_durations) {
+                    if c.start_ms < source_start + track.duration_ms {
+                        let offset = c.start_ms - source_start;
+                        ensure!(
+                            offset < *decoded,
+                            "Chapter '{}' lies in discarded source padding; adjust its start",
+                            c.title
+                        );
+                        export_chapters.push(Chapter {
+                            start_ms: decoded_start + offset,
+                            title: c.title.clone(),
+                        });
+                        break;
+                    }
+                    source_start += track.duration_ms;
+                    decoded_start += decoded;
+                }
+            }
+            total = decoded_durations.iter().sum();
+            if total != p.duration_ms() {
+                event(ExportEvent::Log(format!(
+                    "Chapter timeline aligned to decoded audio: {total} ms (source headers: {} ms)",
+                    p.duration_ms()
+                )));
+            }
+            fs::write(stage.path().join("concat.txt"), list)?;
         }
-        total = decoded_durations.iter().sum();
-        if total != p.duration_ms() {
-            event(ExportEvent::Log(format!(
-                "Chapter timeline aligned to decoded audio: {total} ms (source headers: {} ms)",
-                p.duration_ms()
-            )));
-        }
-        fs::write(stage.path().join("concat.txt"), list)?;
         let mut meta = String::from(";FFMETADATA1\n");
         for (key, val) in [
             ("title", &p.metadata.title),
@@ -746,19 +804,29 @@ impl MediaBackend for DesktopFfmpeg {
         let metadata = stage.path().join("metadata.txt");
         fs::write(&metadata, meta)?;
         let temp = stage.path().join("output.m4b");
-        let mut args: Vec<std::ffi::OsString> = vec![
-            "-n".into(),
-            "-f".into(),
-            "concat".into(),
-            "-safe".into(),
-            "1".into(),
-            "-i".into(),
-            stage.path().join("concat.txt").into_os_string(),
+        let mut args: Vec<std::ffi::OsString> = if remux {
+            vec![
+                "-n".into(),
+                "-i".into(),
+                p.tracks[0].path.as_os_str().into(),
+            ]
+        } else {
+            vec![
+                "-n".into(),
+                "-f".into(),
+                "concat".into(),
+                "-safe".into(),
+                "1".into(),
+                "-i".into(),
+                stage.path().join("concat.txt").into_os_string(),
+            ]
+        };
+        args.extend([
             "-f".into(),
             "ffmetadata".into(),
             "-i".into(),
             metadata.into_os_string(),
-        ];
+        ]);
         if let Some(cover) = &p.cover {
             args.extend(["-i".into(), cover.as_os_str().into()]);
         }
@@ -769,11 +837,14 @@ impl MediaBackend for DesktopFfmpeg {
             "1".into(),
             "-map_chapters".into(),
             "1".into(),
-            "-c:a".into(),
-            "aac".into(),
-            "-b:a".into(),
-            format!("{}k", p.settings.bitrate_kbps).into(),
         ]);
+        args.extend(["-c:a".into(), if remux { "copy" } else { "aac" }.into()]);
+        if !remux {
+            args.extend([
+                "-b:a".into(),
+                format!("{}k", p.settings.bitrate_kbps).into(),
+            ]);
+        }
         if p.cover.is_some() {
             args.extend([
                 "-map".into(),
@@ -795,7 +866,14 @@ impl MediaBackend for DesktopFfmpeg {
             "ipod".into(),
             temp.as_os_str().into(),
         ]);
-        event(ExportEvent::Log("Encoding AAC and chapters".into()));
+        event(ExportEvent::Log(
+            if remux {
+                "Lossless AAC remux and chapters"
+            } else {
+                "Encoding AAC and chapters"
+            }
+            .into(),
+        ));
         self.run(&args, &cancel, event, 0.45, 0.50, total)?;
         let check = self.probe(&temp)?;
         ensure!(check.track.codec == "aac", "Output codec validation failed");
@@ -914,5 +992,27 @@ mod tests {
         assert!(p.validate().is_err());
         p.chapters[1].start_ms = 1000;
         assert!(p.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod alpha_regressions {
+    use super::*;
+    #[test]
+    fn new_default_and_legacy_bitrate_assets_roundtrip() {
+        assert_eq!(Project::default().settings.bitrate_kbps, 160);
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = Project::named("Legacy").unwrap();
+        project.settings.bitrate_kbps = 96;
+        project.cover = Some(PathBuf::from("book.assets/cover.png"));
+        let legacy = dir.path().join("book.json");
+        project.save(&legacy).unwrap();
+        let loaded = Project::load(&legacy).unwrap();
+        assert_eq!(loaded.settings.bitrate_kbps, 96);
+        assert_eq!(loaded.cover, Some(dir.path().join("book.assets/cover.png")));
+        let modern = dir.path().join("book.m4bproj");
+        loaded.save(&modern).unwrap();
+        assert_eq!(Project::load(&modern).unwrap().settings.bitrate_kbps, 96);
+        assert!(legacy.exists());
     }
 }

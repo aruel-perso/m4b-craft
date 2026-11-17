@@ -76,6 +76,73 @@ fn real_export_roundtrip_order_cover_and_no_overwrite() {
     assert_eq!(reopened.cover.as_deref(), Some(output.as_path()));
     assert_eq!(reopened.chapters.len(), p.chapters.len());
     assert_eq!(reopened.metadata.narrator, p.metadata.narrator);
+    // A new default bitrate must not re-encode an existing AAC audiobook.
+    for (i, source) in [&output, p.cover.as_ref().unwrap()].iter().enumerate() {
+        let preview = dir.path().join(format!("preview-{i}.png"));
+        b.extract_cover_preview(source, &preview).unwrap();
+        let bytes = std::fs::read(preview).unwrap();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        assert!(u32::from_be_bytes(bytes[16..20].try_into().unwrap()) <= 560);
+        assert!(u32::from_be_bytes(bytes[20..24].try_into().unwrap()) <= 560);
+    }
+    let mut remux = reopened.clone();
+    remux.settings.bitrate_kbps = 320;
+    remux.metadata.title = "Remuxed title".into();
+    assert!(remux.can_remux());
+    let remux_output = dir.path().join("remuxed.m4b");
+    let mut remux_log = false;
+    b.export(
+        &remux,
+        &remux_output,
+        Arc::new(AtomicBool::new(false)),
+        &mut |event| {
+            if let ExportEvent::Log(message) = event {
+                remux_log |= message.contains("Lossless AAC remux");
+            }
+        },
+    )
+    .unwrap();
+    assert!(remux_log);
+    let packets = |path: &std::path::Path| {
+        let output = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_packets",
+                "-show_data_hash",
+                "sha256",
+                "-show_entries",
+                "packet=data_hash",
+                "-of",
+                "json",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let packets: Vec<String> = result["packets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|packet| packet["data_hash"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(!packets.is_empty());
+        packets
+    };
+    assert_eq!(packets(&output), packets(&remux_output));
+    assert_eq!(
+        b.probe(&remux_output).unwrap().metadata.title,
+        "Remuxed title"
+    );
+    remux.settings.lossless_remux = false;
+    assert!(!remux.can_remux());
     let mut imported = Project::default();
     imported.import(&b, vec![output.clone()]).unwrap();
     assert_eq!(imported.metadata.genre, p.metadata.genre);
