@@ -134,11 +134,14 @@ signed successfully before `gh release create`; prerelease tags use `--prereleas
 The temporary PEM is permission-restricted and removed with an EXIT trap. Local
 scripts never push, tag, publish, call release APIs or configure credentials.
 
-The 0.3 updater contract includes an automatic startup version check and manual
+The 0.3 updater implements an automatic startup version check and manual
 checking, prerelease channel selection, pinned signature/download verification and
-**explicit consent before installation**. Integrate and test that Rust work before
-release. Save projects and stop playback/media work before handoff. Windows uses
-its visible MSI wizard; Mac uses the DMG/app-copy flow. Automatic checking is not
+**explicit consent before installation**. Save projects and stop playback/media
+work before handoff. Windows waits for editor exit, runs Windows Installer with
+visible progress and reopens the app; Mac stages the verified app next to the
+installation, waits for exit, swaps with rollback on a failed launch command and
+reopens the app. macOS requires a user-writable installation parent (for example
+`~/Applications`); this alpha has no privilege-elevation helper. Automatic checking is not
 consent to replace the application. Update signatures do not provide Authenticode
 or Apple publisher identity: expect unknown-publisher/SmartScreen and Gatekeeper
 warnings. Do not claim a live updater, native installation/upgrade or public release

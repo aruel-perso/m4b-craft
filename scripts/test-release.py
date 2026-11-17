@@ -20,6 +20,23 @@ release = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(release)
 
 class ReleaseTests(unittest.TestCase):
+    def test_copy_licenses_accepts_null_license_file(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as d:
+            root = Path(d)
+            package = root/'crate'; package.mkdir()
+            (package/'Cargo.toml').write_text('[package]')
+            (package/'README.md').write_text('not a license')
+            (package/'LICENSE-MIT').write_text('fixture MIT license')
+            out = root/'payload'; out.mkdir()
+            metadata = {'packages': [{'name': 'fixture', 'version': '1.0.0',
+                'source': 'registry+fixture', 'license': 'MIT', 'license_file': None,
+                'manifest_path': str(package/'Cargo.toml')}]}
+            with patch('release_common.subprocess.check_output', return_value=json.dumps(metadata).encode()):
+                release.copy_licenses(out)
+            self.assertEqual((out/'licenses/fixture-1.0.0/LICENSE-MIT').read_text(), 'fixture MIT license')
+            self.assertFalse((out/'licenses/fixture-1.0.0/README.md').exists())
+            self.assertIn('fixture 1.0.0: MIT', (out/'THIRD-PARTY-NOTICES.txt').read_text())
+
     def test_layout_identity(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as d:
             path = Path(d)

@@ -61,9 +61,10 @@ def copy_licenses(destination):
         notices.append(f"{package['name']} {package['version']}: {package.get('license')}")
         base = Path(package['manifest_path']).parent
         candidates = list(base.iterdir())
-        if package.get('license_file'): candidates.append(base/package['license_file'])
+        license_file = base/package['license_file'] if package.get('license_file') else None
+        if license_file is not None: candidates.append(license_file)
         for file in candidates:
-            if file.is_file() and (file.name.upper().startswith(('LICENSE','LICENCE','COPYING','NOTICE','COPYRIGHT')) or str(file) == str(base/package.get('license_file',''))):
+            if file.is_file() and (file.name.upper().startswith(('LICENSE','LICENCE','COPYING','NOTICE','COPYRIGHT')) or file == license_file):
                 dest = destination/'licenses'/f"{package['name']}-{package['version']}"/file.name
                 dest.parent.mkdir(parents=True,exist_ok=True)
                 shutil.copy2(file,dest)

@@ -44,6 +44,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 wixl msitools ffmpeg libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev
       - run: python3 scripts/test-source-fetch.py
+      - run: python3 scripts/test-release.py --scratch "$TMPDIR"
       - run: cargo fetch --locked
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace --locked
