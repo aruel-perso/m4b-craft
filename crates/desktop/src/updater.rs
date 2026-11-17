@@ -1,4 +1,4 @@
-//! Opt-in updater. Trust is rooted only in the compiled Ed25519 public key.
+//! Signed native updater. Trust is rooted only in the compiled Ed25519 public key.
 use anyhow::{ensure, Context, Result};
 use ed25519_dalek::{Signature, VerifyingKey};
 use reqwest::{blocking::Client, redirect::Policy, Url};
@@ -12,7 +12,17 @@ use std::{
 
 const REPO: &str = "https://github.com/aruel-perso/m4b-craft/releases/download/";
 const MAX_MSI: u64 = 512 * 1024 * 1024;
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 const PLATFORM: &str = "windows-x86_64";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PLATFORM: &str = "macos-aarch64";
+fn extension(platform: &str) -> Result<&'static str> {
+    match platform {
+        "windows-x86_64" => Ok("msi"),
+        "macos-aarch64" => Ok("dmg"),
+        _ => anyhow::bail!("Unsupported platform"),
+    }
+}
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Channel {
     Stable,
@@ -51,8 +61,15 @@ struct Release {
     prerelease: bool,
 }
 
+pub fn error_log() -> std::path::PathBuf {
+    crate::preferences_path().with_file_name("update-install-error.log")
+}
+
 pub fn supported() -> bool {
-    cfg!(all(target_os = "windows", target_arch = "x86_64"))
+    cfg!(any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    ))
 }
 
 pub fn guard(busy: bool, dirty: bool, installing: bool) -> Result<()> {
@@ -117,6 +134,15 @@ fn get(client: &Client, url: &str, max: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 fn verify_with(bytes: &[u8], channel: Channel, current: &str, key: &[u8; 32]) -> Result<Verified> {
+    verify_platform(bytes, channel, current, key, PLATFORM)
+}
+fn verify_platform(
+    bytes: &[u8],
+    channel: Channel,
+    current: &str,
+    key: &[u8; 32],
+    platform: &str,
+) -> Result<Verified> {
     ensure!(bytes.len() <= 16384, "Oversize manifest");
     let envelope: Envelope = serde_json::from_slice(bytes)?;
     let signature = Signature::from_slice(&hex::decode(&envelope.signature)?)?;
@@ -134,9 +160,15 @@ fn verify_with(bytes: &[u8], channel: Channel, current: &str, key: &[u8; 32]) ->
         channel == Channel::Prerelease || version.pre.is_empty(),
         "Prerelease on stable channel"
     );
-    ensure!(m.platform == PLATFORM, "Wrong platform");
+    ensure!(m.platform == platform, "Wrong platform");
     ensure!(
-        m.filename == format!("m4b-Craft-{}-windows-x86_64.msi", m.version),
+        m.filename
+            == format!(
+                "m4b-Craft-{}-{}.{}",
+                m.version,
+                platform,
+                extension(platform)?
+            ),
         "Unexpected filename"
     );
     ensure!(m.size > 0 && m.size <= MAX_MSI, "Invalid installer size");
@@ -164,7 +196,7 @@ pub fn verify(bytes: &[u8], channel: Channel) -> Result<Verified> {
 }
 pub fn check(channel: Channel, busy: bool) -> Result<Verified> {
     guard(busy, false, false)?;
-    ensure!(supported(), "Updates are available on Windows x86_64 only");
+    ensure!(supported(), "Updates require Windows x86_64 or macOS ARM64");
     let client = client()?;
     let releases: Vec<Release> = serde_json::from_slice(&get(
         &client,
@@ -185,7 +217,7 @@ pub fn check(channel: Channel, busy: bool) -> Result<Verified> {
     let result = verify(
         &get(
             &client,
-            &format!("{REPO}v{version}/update-windows-x86_64.json"),
+            &format!("{REPO}v{version}/update-{PLATFORM}.json"),
             16384,
         )?,
         channel,
@@ -197,9 +229,16 @@ pub fn check(channel: Channel, busy: bool) -> Result<Verified> {
     Ok(result)
 }
 impl Verified {
+    #[cfg(test)]
     pub fn download(self, busy: bool) -> Result<Download> {
+        self.download_progress(busy, |_| {})
+    }
+    pub fn matches_channel(&self, channel: Channel) -> bool {
+        self.channel == channel
+    }
+    pub fn download_progress(self, busy: bool, mut progress: impl FnMut(f32)) -> Result<Download> {
         guard(busy, false, false)?;
-        ensure!(supported(), "Updates are available on Windows x86_64 only");
+        ensure!(supported(), "Updates require Windows x86_64 or macOS ARM64");
         let verified = verify(&self.envelope, self.channel)?;
         let client = client()?;
         let response = client
@@ -214,9 +253,21 @@ impl Verified {
         );
         let mut file = tempfile::Builder::new()
             .prefix("m4b-update-")
-            .suffix(".msi")
+            .suffix(&format!(".{}", extension(PLATFORM)?))
             .tempfile()?;
-        let count = std::io::copy(&mut response.take(verified.manifest.size + 1), &mut file)?;
+        let mut response = response.take(verified.manifest.size + 1);
+        let mut count = 0u64;
+        let mut buffer = [0u8; 65536];
+        loop {
+            let n = response.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            count += n as u64;
+            ensure!(count <= verified.manifest.size, "Oversize installer");
+            file.write_all(&buffer[..n])?;
+            progress(count as f32 / verified.manifest.size as f32);
+        }
         ensure!(count == verified.manifest.size, "Incorrect download size");
         file.flush()?;
         let download = Download { verified, file };
@@ -235,29 +286,183 @@ impl Download {
         self.reverify()?;
         #[cfg(target_os = "windows")]
         {
-            let installer = std::path::PathBuf::from(
+            let system = std::path::PathBuf::from(
                 std::env::var_os("SystemRoot").context("Missing Windows system directory")?,
             )
-            .join("System32/msiexec.exe");
-            // The editor must release its executable before MSI replaces it. Retain the
-            // verified download across process exit; never delete it while MSI is using it.
+            .join("System32");
+            let executable = std::env::current_exe()?;
             let path = self.file.into_temp_path().keep()?;
-            match std::process::Command::new(installer)
-                .arg("/i")
-                .arg(&path)
-                .spawn()
-            {
-                Ok(_child) => Ok(()),
+            let result =
+                std::process::Command::new(system.join("WindowsPowerShell/v1.0/powershell.exe"))
+                    .args(["-NoProfile", "-NonInteractive", "-Command", WINDOWS_HANDOFF])
+                    .env("M4B_UPDATE_PID", std::process::id().to_string())
+                    .env("M4B_UPDATE_MSI", &path)
+                    .env("M4B_UPDATE_APP", &executable)
+                    .env("M4B_UPDATE_LOG", error_log())
+                    .spawn();
+            match result {
+                Ok(_) => Ok(()),
                 Err(error) => {
                     let _ = std::fs::remove_file(&path);
-                    Err(error).context("Launch Windows Installer")
+                    Err(error).context("Launch Windows update helper")
                 }
             }
         }
-        #[cfg(not(target_os = "windows"))]
-        anyhow::bail!("Installation is supported on Windows only")
+        #[cfg(target_os = "macos")]
+        {
+            self.install_macos()
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        anyhow::bail!("Native installation unsupported on this platform")
     }
 }
+#[cfg(target_os = "windows")]
+const WINDOWS_HANDOFF: &str = r#"$ParentId = [int]$env:M4B_UPDATE_PID
+$Installer = $env:M4B_UPDATE_MSI
+$Application = $env:M4B_UPDATE_APP
+$ErrorActionPreference = 'Stop'
+try {
+    Wait-Process -Id $ParentId -ErrorAction SilentlyContinue
+    $msiexec = Join-Path $env:SystemRoot 'System32\msiexec.exe'
+    $child = Start-Process -FilePath $msiexec -ArgumentList @('/i', ('"' + $Installer + '"'), '/passive', '/norestart') -Wait -PassThru
+    if ($child.ExitCode -notin @(0, 3010, 1641)) { throw "Windows Installer exited with code $($child.ExitCode)" }
+    Remove-Item -LiteralPath $Installer
+    Remove-Item -LiteralPath $env:M4B_UPDATE_LOG -ErrorAction SilentlyContinue
+    if ($child.ExitCode -ne 1641) { Start-Process -FilePath $Application }
+} catch {
+    $_ | Out-File -Encoding utf8 -LiteralPath $env:M4B_UPDATE_LOG
+    Start-Process -FilePath $Application
+}
+"#;
+
+#[cfg(any(target_os = "macos", test))]
+fn arm64_binary(path: &std::path::Path) -> Result<bool> {
+    let mut header = Vec::new();
+    std::fs::File::open(path)?
+        .take(4096)
+        .read_to_end(&mut header)?;
+    if header.len() < 8 {
+        return Ok(false);
+    }
+    if header[..4] == [0xcf, 0xfa, 0xed, 0xfe] {
+        return Ok(u32::from_le_bytes(header[4..8].try_into()?) == 0x0100000c);
+    }
+    let stride = match header[..4] {
+        [0xca, 0xfe, 0xba, 0xbe] => 20,
+        [0xca, 0xfe, 0xba, 0xbf] => 32,
+        _ => return Ok(false),
+    };
+    let count = u32::from_be_bytes(header[4..8].try_into()?) as usize;
+    ensure!(
+        count <= 64 && header.len() >= 8 + count * stride,
+        "Invalid universal binary header"
+    );
+    Ok((0..count).any(|i| header[8 + i * stride..12 + i * stride] == [1, 0, 0, 12]))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn mac_install_location_error(parent: &std::path::Path) -> String {
+    format!("Cannot stage update in {}. Run m4b-Craft from an installed .app in a user-writable directory such as ~/Applications (create it and copy the app there, eject the DMG, then reopen it). Automatic updates require a writable installation directory; no administrator elevation is requested. / Lancez l’application installée dans un dossier accessible en écriture, par exemple ~/Applications, éjectez le DMG puis relancez-la. Aucune élévation administrateur n’est demandée.", parent.display())
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Download {
+    fn install_macos(self) -> Result<()> {
+        use std::process::Command;
+        let exe = std::env::current_exe()?.canonicalize()?;
+        let app = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .context("Missing app bundle")?;
+        ensure!(
+            app.extension().is_some_and(|e| e == "app")
+                && exe.ends_with("Contents/MacOS/m4b-Craft"),
+            "Not running from an installed .app. Copy m4b-Craft.app to a user-writable directory such as ~/Applications, eject the DMG, then reopen the installed app."
+        );
+        let parent = app.parent().context("Missing installation directory")?;
+        let stage = tempfile::Builder::new()
+            .prefix(".m4b-update-")
+            .tempdir_in(parent)
+            .with_context(|| mac_install_location_error(parent))?;
+        let mount = tempfile::tempdir()?;
+        let status = Command::new("/usr/bin/hdiutil")
+            .args(["attach", "-readonly", "-nobrowse", "-mountpoint"])
+            .arg(mount.path())
+            .arg(self.file.path())
+            .status()?;
+        ensure!(status.success(), "Unable to mount verified DMG");
+        let staged = stage.path().join("m4b-Craft.app");
+        let source = mount.path().join("m4b-Craft.app");
+        let copy = (|| -> Result<()> {
+            ensure!(
+                source.join("Contents/MacOS/m4b-Craft").is_file(),
+                "DMG missing application"
+            );
+            for name in ["m4b-Craft", "m4b-cli", "ffmpeg", "ffprobe"] {
+                let binary = source.join("Contents/MacOS").join(name);
+                ensure!(binary.is_file(), "Bundle missing {name}");
+                ensure!(arm64_binary(&binary)?, "Bundle binary is not ARM64: {name}");
+            }
+            ensure!(
+                Command::new("/usr/bin/ditto")
+                    .arg(&source)
+                    .arg(&staged)
+                    .status()?
+                    .success(),
+                "Unable to stage app next to installation"
+            );
+            Ok(())
+        })();
+        let detached = Command::new("/usr/bin/hdiutil")
+            .arg("detach")
+            .arg(mount.path())
+            .status();
+        copy?;
+        ensure!(detached?.success(), "Unable to detach DMG");
+        let script = stage.path().join("handoff.sh");
+        std::fs::write(&script, MAC_HANDOFF)?;
+        let child = Command::new("/bin/sh")
+            .arg(&script)
+            .arg(std::process::id().to_string())
+            .arg(app)
+            .arg(&staged)
+            .arg(stage.path())
+            .arg(error_log())
+            .spawn();
+        child.context("Launch update helper")?;
+        let _retained = stage.keep();
+        Ok(())
+    }
+}
+// Fixed program; every path is a positional argument, never interpolated shell code.
+#[cfg(any(target_os = "macos", test))]
+const MAC_HANDOFF: &str = r#"#!/bin/sh
+pid=$1
+app=$2
+staged=$3
+work=$4
+backup="$work/previous.app"
+log=$5
+exec >>"$log" 2>&1
+while kill -0 "$pid" 2>/dev/null; do /bin/sleep 1; done
+if ! /bin/mv "$app" "$backup"; then echo "Update failed: cannot move installed app"; exit 1; fi
+if ! /bin/mv "$staged" "$app"; then
+    /bin/mv "$backup" "$app"
+    /usr/bin/open "$app"
+    exit 1
+fi
+if ! /usr/bin/open "$app"; then
+    /bin/mv "$app" "$work/failed.app"
+    /bin/mv "$backup" "$app"
+    /usr/bin/open "$app"
+    exit 1
+fi
+/bin/rm -rf "$backup"
+/bin/rm -f "$log"
+# Keep diagnostic log and helper; projects are never touched.
+"#;
+
 fn verify_file(mut file: std::fs::File, manifest: &Manifest) -> Result<()> {
     ensure!(
         file.metadata()?.len() == manifest.size,
@@ -293,8 +498,8 @@ mod tests {
     fn signed(version: &str, change: impl FnOnce(&mut serde_json::Value)) -> (Vec<u8>, [u8; 32]) {
         let key = SigningKey::from_bytes(&[42; 32]);
         let mut value = serde_json::json!({"version":version,"platform":PLATFORM,
-            "filename":format!("m4b-Craft-{version}-windows-x86_64.msi"),"sha256":"ab".repeat(32),"size":10,
-            "url":format!("{REPO}v{version}/m4b-Craft-{version}-windows-x86_64.msi")});
+            "filename":format!("m4b-Craft-{version}-{PLATFORM}.{}", extension(PLATFORM).unwrap()),"sha256":"ab".repeat(32),"size":10,
+            "url":format!("{REPO}v{version}/m4b-Craft-{version}-{PLATFORM}.{}", extension(PLATFORM).unwrap())});
         change(&mut value);
         let payload = value.to_string();
         let signature = hex::encode(key.sign(payload.as_bytes()).to_bytes());
@@ -303,6 +508,96 @@ mod tests {
                 .unwrap(),
             key.verifying_key().to_bytes(),
         )
+    }
+    #[test]
+    fn mac_location_error_explains_recovery() {
+        let message = mac_install_location_error(std::path::Path::new("/Applications"));
+        assert!(message.contains("/Applications"));
+        assert!(message.contains("~/Applications"));
+        assert!(message.contains("no administrator elevation"));
+    }
+    #[test]
+    fn candidate_must_match_selected_channel() {
+        let (bytes, key) = signed("0.3.0", |_| {});
+        let update = verify_with(&bytes, Channel::Stable, "0.2.0", &key).unwrap();
+        assert!(update.matches_channel(Channel::Stable));
+        assert!(!update.matches_channel(Channel::Prerelease));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn mac_helper_waits_for_parent_and_reports_swap_failure() {
+        let d = tempfile::tempdir().unwrap();
+        let script = d.path().join("helper.sh");
+        std::fs::write(&script, MAC_HANDOFF).unwrap();
+        let staged = d.path().join("staged.app");
+        std::fs::create_dir(&staged).unwrap();
+        let log = d.path().join("error.log");
+        let mut parent = std::process::Command::new("/bin/sleep")
+            .arg("1")
+            .spawn()
+            .unwrap();
+        let mut helper = std::process::Command::new("/bin/sh")
+            .arg(&script)
+            .arg(parent.id().to_string())
+            .arg(d.path().join("missing $(touch injected).app"))
+            .arg(&staged)
+            .arg(d.path())
+            .arg(&log)
+            .spawn()
+            .unwrap();
+        assert!(helper.try_wait().unwrap().is_none());
+        parent.wait().unwrap();
+        assert!(!helper.wait().unwrap().success());
+        assert!(staged.is_dir());
+        assert!(!d.path().join("injected").exists());
+        assert!(std::fs::read_to_string(log)
+            .unwrap()
+            .contains("cannot move installed app"));
+    }
+    #[test]
+    fn native_arm64_header_and_fixed_helper_syntax() {
+        let _native_handoff: fn(Download) -> Result<()> = Download::install_macos;
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), [0xcf, 0xfa, 0xed, 0xfe, 12, 0, 0, 1]).unwrap();
+        assert!(arm64_binary(f.path()).unwrap());
+        std::fs::write(f.path(), [0xcf, 0xfa, 0xed, 0xfe, 7, 0, 0, 1]).unwrap();
+        assert!(!arm64_binary(f.path()).unwrap());
+        #[cfg(unix)]
+        {
+            std::fs::write(f.path(), MAC_HANDOFF).unwrap();
+            assert!(std::process::Command::new("/bin/sh")
+                .arg("-n")
+                .arg(f.path())
+                .status()
+                .unwrap()
+                .success());
+        }
+    }
+    #[test]
+    fn macos_signature_platform_and_suffix() {
+        let (bytes, key) = signed("0.4.0-alpha.2", |m| {
+            m["platform"] = "macos-aarch64".into();
+            m["filename"] = "m4b-Craft-0.4.0-alpha.2-macos-aarch64.dmg".into();
+            m["url"] =
+                format!("{REPO}v0.4.0-alpha.2/m4b-Craft-0.4.0-alpha.2-macos-aarch64.dmg").into();
+        });
+        assert!(verify_platform(
+            &bytes,
+            Channel::Prerelease,
+            "0.3.0-alpha.1",
+            &key,
+            "macos-aarch64"
+        )
+        .is_ok());
+        assert!(verify_platform(
+            &bytes,
+            Channel::Prerelease,
+            "0.3.0-alpha.1",
+            &key,
+            "windows-x86_64"
+        )
+        .is_err());
+        assert!(MAC_HANDOFF.contains("while kill -0"));
     }
     #[test]
     fn rejects_file_tampering_before_launch() {

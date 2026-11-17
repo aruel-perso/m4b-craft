@@ -1,5 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 mod playback;
+mod preferences;
 mod updater;
 use m4b_core::{Cancel, Chapter, DesktopFfmpeg, ExportEvent, MediaBackend, Project};
 use playback::{CommandMessage as AudioCommand, Playback};
@@ -23,7 +24,10 @@ fn main() -> eframe::Result<()> {
 }
 use eframe::egui;
 enum Message {
-    UpdateChecked(Result<updater::Verified, String>),
+    Cover(PathBuf, Result<egui::ColorImage, String>),
+    UpdateProgress(f32),
+    Encoders(Result<bool, String>),
+    UpdateChecked(updater::Channel, Result<updater::Verified, String>),
     UpdateDownloaded(Result<updater::Download, String>),
     UpdateInstalled(Result<(), String>),
     Loaded(Box<Result<Project, String>>, Option<Option<PathBuf>>),
@@ -39,10 +43,15 @@ enum Section {
     Settings,
 }
 struct App {
-    updates_enabled: bool,
+    prefs: preferences::Preferences,
+    selected: bool,
+    startup_checked: bool,
+    checking: bool,
+    cover_path: Option<PathBuf>,
+    cover_texture: Option<egui::TextureHandle>,
+    cover_error: String,
     update_channel: updater::Channel,
     update_candidate: Option<updater::Verified>,
-    update_download: Option<updater::Download>,
     section: Section,
     creating: bool,
     new_name: String,
@@ -72,16 +81,38 @@ impl Default for App {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel();
         let recovery = recovery_path();
+        let installer_error = std::fs::File::open(updater::error_log())
+            .ok()
+            .and_then(|file| {
+                use std::io::Read;
+                let mut text = String::new();
+                file.take(16384).read_to_string(&mut text).ok()?;
+                Some(text)
+            })
+            .filter(|s| !s.trim().is_empty());
+        let prefs = preferences::Preferences::load(&preferences_path());
+        let mut project = Project::default();
+        project.settings.language = prefs.language.clone();
+        let channel = if prefs.prerelease {
+            updater::Channel::Prerelease
+        } else {
+            updater::Channel::Stable
+        };
         Self {
-            updates_enabled: false,
-            update_channel: updater::Channel::Stable,
+            prefs,
+            selected: false,
+            startup_checked: false,
+            checking: false,
+            cover_path: None,
+            cover_texture: None,
+            cover_error: String::new(),
+            update_channel: channel,
             update_candidate: None,
-            update_download: None,
             section: Section::Tracks,
             creating: false,
             new_name: String::new(),
             allow_close: false,
-            project: Project::default(),
+            project,
             path: None,
             backend: DesktopFfmpeg::default(),
             tx,
@@ -90,8 +121,8 @@ impl Default for App {
             exporting: false,
             cancel: Arc::new(AtomicBool::new(false)),
             progress: 0.,
-            logs: vec![],
-            status: String::new(),
+            logs: installer_error.clone().into_iter().collect(),
+            status: installer_error.unwrap_or_default(),
             last_save: Instant::now(),
             dirty: false,
             recovery: recovery.filter(|p| p.exists()),
@@ -113,7 +144,80 @@ fn recovery_path() -> Option<PathBuf> {
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("recovery.autosave.json"))
 }
+fn preferences_path() -> PathBuf {
+    recovery_path()
+        .unwrap_or_else(|| std::env::temp_dir().join("m4b-recovery"))
+        .with_file_name("preferences.json")
+}
 impl App {
+    fn check_updates(&mut self) {
+        self.checking = true;
+        let tx = self.tx.clone();
+        let channel = self.update_channel;
+        std::thread::spawn(move || {
+            let _ = tx.send(Message::UpdateChecked(
+                channel,
+                updater::check(channel, false).map_err(|e| format!("Update check: {e:#}")),
+            ));
+        });
+    }
+    fn update_settings(&mut self, ui: &mut egui::Ui) {
+        ui.label(self.text(
+            "GitHub updates are checked automatically at startup.",
+            "Les mises à jour GitHub sont vérifiées au démarrage.",
+        ));
+        let previous = self.update_channel;
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.update_channel, updater::Channel::Stable, "Stable");
+            ui.selectable_value(
+                &mut self.update_channel,
+                updater::Channel::Prerelease,
+                "Include prereleases / Inclure les préversions",
+            );
+        });
+        if previous != self.update_channel {
+            self.update_candidate = None;
+            self.prefs.prerelease = self.update_channel == updater::Channel::Prerelease;
+            let _ = self.prefs.save(&preferences_path());
+        }
+        if ui
+            .add_enabled(
+                !self.checking && !self.busy && !self.playback.is_busy(),
+                egui::Button::new(
+                    self.text("Check GitHub Releases", "Vérifier les versions GitHub"),
+                ),
+            )
+            .clicked()
+        {
+            self.check_updates();
+        }
+    }
+    fn remember(&mut self) {
+        if let Some(path) = self.path.clone() {
+            self.prefs.remember(path);
+        }
+        let _ = self.prefs.save(&preferences_path());
+    }
+    fn load_path(&mut self, path: PathBuf) {
+        let is_project = path
+            .extension()
+            .is_some_and(|s| s.eq_ignore_ascii_case("json") || s.eq_ignore_ascii_case("m4bproj"));
+        let project_path = if is_project { Some(path.clone()) } else { None };
+        let b = self.backend.clone();
+        let tx = self.tx.clone();
+        self.busy = true;
+        std::thread::spawn(move || {
+            let r = if is_project {
+                Project::load(&path)
+            } else {
+                b.open(&path)
+            };
+            let _ = tx.send(Message::Loaded(
+                Box::new(r.map_err(|e| format!("{e:#}"))),
+                Some(project_path),
+            ));
+        });
+    }
     fn confirm_replace(&mut self) -> bool {
         if !self.dirty {
             return true;
@@ -129,6 +233,43 @@ impl App {
         replacement_allowed(choice, !self.dirty)
     }
 
+    fn navigate_preview(&mut self, next: bool) {
+        let Some(index) = self.preview_track else {
+            return;
+        };
+        if self.project.tracks.len() == 1 && !self.project.chapters.is_empty() {
+            let position = self.preview.position_ms;
+            let target = if next {
+                self.project
+                    .chapters
+                    .iter()
+                    .find(|c| c.start_ms > position)
+                    .map(|c| c.start_ms)
+            } else {
+                self.project
+                    .chapters
+                    .iter()
+                    .rev()
+                    .find(|c| c.start_ms < position.saturating_sub(1000))
+                    .map(|c| c.start_ms)
+                    .or(Some(0))
+            };
+            if let Some(ms) = target {
+                self.play_preview(0, ms);
+            }
+        } else {
+            let target = if next {
+                index
+                    .checked_add(1)
+                    .filter(|i| *i < self.project.tracks.len())
+            } else {
+                index.checked_sub(1)
+            };
+            if let Some(i) = target {
+                self.play_preview(i, 0);
+            }
+        }
+    }
     fn stop_preview(&mut self) {
         self.playback.send(AudioCommand::Stop);
         self.preview_track = None;
@@ -159,11 +300,26 @@ impl App {
         }
     }
     fn save(&mut self, choose: bool) {
+        if !self.selected {
+            return;
+        }
         let path = if choose || self.path.is_none() {
             rfd::FileDialog::new()
-                .add_filter("m4b-Craft project", &["json"])
-                .set_file_name("book.json")
+                .add_filter("m4b-Craft project", &["m4bproj"])
+                .set_file_name("book.m4bproj")
                 .save_file()
+                .and_then(|p| {
+                    let target = project_save_target(&p);
+                    let exists = target.exists();
+                    let consent = !exists
+                        || rfd::MessageDialog::new()
+                            .set_title("Overwrite project / Remplacer le projet")
+                            .set_description(format!("Replace / Remplacer {} ?", target.display()))
+                            .set_buttons(rfd::MessageButtons::YesNo)
+                            .show()
+                            == rfd::MessageDialogResult::Yes;
+                    overwrite_allowed(exists, consent).then_some(target)
+                })
         } else {
             self.path.clone()
         };
@@ -171,6 +327,7 @@ impl App {
             match self.project.save(&path) {
                 Ok(()) => {
                     self.path = Some(path);
+                    self.remember();
                     self.dirty = false;
                     if let Some(recovery) = recovery_path() {
                         let _ = std::fs::remove_file(recovery);
@@ -183,6 +340,9 @@ impl App {
         }
     }
     fn import(&mut self) {
+        if !self.selected {
+            return;
+        }
         if self.path.is_none() {
             if !self.confirm_replace() {
                 return;
@@ -226,30 +386,16 @@ impl App {
             return;
         }
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Project / M4B", &["json", "m4b", "m4a"])
+            .add_filter("Project / M4B", &["m4bproj", "json", "m4b", "m4a"])
             .pick_file()
         {
-            let is_project = path
-                .extension()
-                .is_some_and(|s| s.eq_ignore_ascii_case("json"));
-            let project_path = if is_project { Some(path.clone()) } else { None };
-            let b = self.backend.clone();
-            let tx = self.tx.clone();
-            self.busy = true;
-            std::thread::spawn(move || {
-                let r = if is_project {
-                    Project::load(&path)
-                } else {
-                    b.open(&path)
-                };
-                let _ = tx.send(Message::Loaded(
-                    Box::new(r.map_err(|e| format!("{e:#}"))),
-                    Some(project_path),
-                ));
-            });
+            self.load_path(path);
         }
     }
     fn export(&mut self) {
+        if !self.selected {
+            return;
+        }
         if let Err(e) = self.project.validate() {
             self.log(format!("Validation: {e:#}"));
             return;
@@ -286,8 +432,30 @@ impl eframe::App for App {
         }
         while let Ok(m) = self.rx.try_recv() {
             match m {
-                Message::UpdateChecked(result) => {
+                Message::Cover(path, result) => {
+                    if self.cover_path.as_ref() == Some(&path) {
+                        match result {
+                            Ok(image) => {
+                                self.cover_texture =
+                                    Some(ctx.load_texture("cover", image, Default::default()))
+                            }
+                            Err(e) => self.cover_error = e,
+                        }
+                    }
+                }
+                Message::Encoders(result) => {
                     self.busy = false;
+                    match result {
+                        Ok(v) => self.bitrate_available = Some(v),
+                        Err(e) => self.log(e),
+                    }
+                }
+                Message::UpdateProgress(p) => self.progress = p,
+                Message::UpdateChecked(channel, result) => {
+                    self.checking = false;
+                    if channel != self.update_channel {
+                        continue;
+                    }
                     match result {
                         Ok(update) => {
                             self.status = format!("Verified update {}", update.manifest.version);
@@ -300,9 +468,14 @@ impl eframe::App for App {
                     self.busy = false;
                     match result {
                         Ok(download) => {
-                            self.update_download = Some(download);
-                            self.status =
-                                "Verified installer ready. Save project before installing.".into();
+                            self.status = "Preparing verified installer / Préparation de la mise à jour vérifiée…".into();
+                            let tx = self.tx.clone();
+                            self.busy = true;
+                            std::thread::spawn(move || {
+                                let _ = tx.send(Message::UpdateInstalled(
+                                    download.install(false, false).map_err(|e| format!("{e:#}")),
+                                ));
+                            });
                         }
                         Err(error) => self.log(error),
                     }
@@ -325,10 +498,15 @@ impl eframe::App for App {
                         Ok(p) => {
                             self.stop_preview();
                             self.project = p;
+                            self.cover_path = None;
+                            self.cover_texture = None;
+                            self.project.settings.language = self.prefs.language.clone();
+                            self.selected = true;
                             let clean = matches!(&path, Some(Some(_)));
                             if let Some(path) = path {
                                 self.path = path;
                             }
+                            self.remember();
                             self.dirty = !clean;
                             self.log("Loaded / Chargé".into());
                         }
@@ -363,6 +541,69 @@ impl eframe::App for App {
                 self.allow_close = true;
                 self.dirty = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+        if !self.startup_checked && !self.busy && !self.playback.is_busy() {
+            self.startup_checked = true;
+            self.check_updates();
+        }
+        if self.update_candidate.is_some() && !self.busy && !self.playback.is_busy() {
+            let version = self
+                .update_candidate
+                .as_ref()
+                .unwrap()
+                .manifest
+                .version
+                .clone();
+            egui::Window::new(self.text("Update available", "Mise à jour disponible"))
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    ui.label(format!("{} → {}", env!("CARGO_PKG_VERSION"), version));
+                    if ui.button(self.text("Later", "Plus tard")).clicked() {
+                        self.update_candidate = None;
+                    }
+                    if ui.button(self.text("Update", "Mettre à jour")).clicked() {
+                        if self.dirty {
+                            self.save(false);
+                        }
+                        if updater::guard(self.busy || self.playback.is_busy(), self.dirty, true)
+                            .is_ok()
+                        {
+                            if let Some(update) = self
+                                .update_candidate
+                                .take()
+                                .filter(|u| u.matches_channel(self.update_channel))
+                            {
+                                self.busy = true;
+                                self.progress = 0.;
+                                self.status = "Downloading / Téléchargement…".into();
+                                let tx = self.tx.clone();
+                                std::thread::spawn(move || {
+                                    let progress_tx = tx.clone();
+                                    let result = update
+                                        .download_progress(false, |p| {
+                                            let _ = progress_tx.send(Message::UpdateProgress(p));
+                                        })
+                                        .map_err(|e| format!("Update download: {e:#}"));
+                                    let _ = tx.send(Message::UpdateDownloaded(result));
+                                });
+                            }
+                        }
+                    }
+                });
+        }
+        if self.cover_path != self.project.cover {
+            self.cover_path = self.project.cover.clone();
+            self.cover_texture = None;
+            self.cover_error.clear();
+            if let Some(path) = self.cover_path.clone() {
+                let tx = self.tx.clone();
+                let backend = self.backend.clone();
+                std::thread::spawn(move || {
+                    let result = load_cover(&backend, &path)
+                        .map_err(|e| format!("Unreadable cover / Couverture illisible: {e:#}"));
+                    let _ = tx.send(Message::Cover(path, result));
+                });
             }
         }
         // Follow OS theme when system is selected; egui polls native theme changes.
@@ -420,19 +661,36 @@ impl eframe::App for App {
                         }
                     });
                 });
-                ui.label(format!(
-                    "{}{}",
-                    if self.project.name.is_empty() {
-                        "m4b-Craft"
-                    } else {
-                        &self.project.name
-                    },
-                    if self.dirty { " *" } else { "" }
-                ));
-                if self.exporting && ui.button("Cancel export / Annuler export").clicked() {
-                    self.cancel.store(true, Ordering::Relaxed);
+                if ui.button(self.text("Settings", "Réglages")).clicked() {
+                    self.section = Section::Settings;
+                }
+                if self.selected
+                    && ui
+                        .button(self.text("Close project", "Fermer projet"))
+                        .clicked()
+                    && !self.busy
+                    && self.confirm_replace()
+                {
+                    self.stop_preview();
+                    self.selected = false;
+                    self.project = Project::default();
+                    self.project.settings.language = self.prefs.language.clone();
+                    self.path = None;
+                    self.dirty = false;
                 }
             });
+            ui.label(format!(
+                "{}{}",
+                if self.project.name.is_empty() {
+                    "m4b-Craft"
+                } else {
+                    &self.project.name
+                },
+                if self.dirty { " *" } else { "" }
+            ));
+            if self.exporting && ui.button("Cancel export / Annuler export").clicked() {
+                self.cancel.store(true, Ordering::Relaxed);
+            }
             if let Some(recovery) = self.recovery.clone() {
                 ui.horizontal(|ui| {
                     ui.label(self.text("Recovery available", "Récupération disponible"));
@@ -451,6 +709,7 @@ impl eframe::App for App {
                             Ok(p) => {
                                 self.stop_preview();
                                 self.project = p;
+                                self.selected = true;
                                 self.path = None;
                                 self.dirty = true;
                                 self.recovery = None;
@@ -481,6 +740,67 @@ impl eframe::App for App {
                 },
             );
         });
+        if !self.busy && (self.preview.active || self.preview.paused) {
+            egui::TopBottomPanel::bottom("transport").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("⏮").clicked() {
+                        self.navigate_preview(false);
+                    }
+                    if ui
+                        .button(if self.preview.paused { "▶" } else { "⏸" })
+                        .clicked()
+                    {
+                        self.playback
+                            .send(AudioCommand::Pause(!self.preview.paused));
+                    }
+                    if ui.button("⏹").clicked() {
+                        self.stop_preview();
+                    }
+                    if ui.button("⏭").clicked() {
+                        self.navigate_preview(true);
+                    }
+                    if let Some(index) = self.preview_track {
+                        if let Some(track) = self.project.tracks.get(index) {
+                            let title = if self.project.tracks.len() == 1 {
+                                self.project
+                                    .chapters
+                                    .iter()
+                                    .rev()
+                                    .find(|c| c.start_ms <= self.preview.position_ms)
+                                    .map(|c| c.title.clone())
+                            } else {
+                                None
+                            }
+                            .unwrap_or_else(|| {
+                                track
+                                    .path
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .into_owned()
+                            });
+                            ui.label(title);
+                            ui.label(format!(
+                                "{} / {}",
+                                playback::clock(self.preview.position_ms),
+                                playback::clock(track.duration_ms)
+                            ));
+                            let response = ui.add(
+                                egui::Slider::new(&mut self.seek_ms, 0..=track.duration_ms)
+                                    .show_value(false),
+                            );
+                            if response.drag_stopped()
+                                || (response.changed() && !response.dragged())
+                            {
+                                self.play_preview(index, self.seek_ms);
+                            } else if !response.dragged() {
+                                self.seek_ms = self.preview.position_ms;
+                            }
+                        }
+                    }
+                });
+            });
+        }
         if self.creating {
             egui::Window::new("New project / Nouveau projet")
                 .collapsible(false)
@@ -495,18 +815,36 @@ impl eframe::App for App {
                         .clicked()
                     {
                         if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Project", &["json"])
-                            .set_file_name("book.json")
+                            .add_filter("Project", &["m4bproj"])
+                            .set_file_name("book.m4bproj")
                             .save_file()
+                            .and_then(|p| {
+                                let target = project_save_target(&p);
+                                let exists = target.exists();
+                                let consent = !exists
+                                    || rfd::MessageDialog::new()
+                                        .set_title("Overwrite project / Remplacer le projet")
+                                        .set_description(format!(
+                                            "Replace / Remplacer {} ?",
+                                            target.display()
+                                        ))
+                                        .set_buttons(rfd::MessageButtons::YesNo)
+                                        .show()
+                                        == rfd::MessageDialogResult::Yes;
+                                overwrite_allowed(exists, consent).then_some(target)
+                            })
                         {
                             let mut project =
                                 Project::named(&self.new_name).expect("validated project name");
                             project.settings = self.project.settings.clone();
+                            project.settings.bitrate_kbps = 160;
                             match project.save_new(&path) {
                                 Ok(()) => {
                                     self.stop_preview();
                                     self.project = project;
+                                    self.selected = true;
                                     self.path = Some(path);
+                                    self.remember();
                                     self.dirty = false;
                                     self.creating = false;
                                     self.section = Section::Tracks;
@@ -520,8 +858,59 @@ impl eframe::App for App {
                     }
                 });
         }
-        egui::SidePanel::left("navigation")
-            .resizable(false)
+        if !self.selected {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.heading(self.text("Welcome to m4b-Craft", "Bienvenue dans m4b-Craft"));
+                ui.add_enabled_ui(!self.busy && !self.creating, |ui| {
+                    if ui
+                        .button(self.text("Create project…", "Créer un projet…"))
+                        .clicked()
+                    {
+                        self.creating = true;
+                    }
+                    if ui
+                        .button(self.text("Open project…", "Ouvrir un projet…"))
+                        .clicked()
+                    {
+                        self.open();
+                    }
+                    if self.section == Section::Settings {
+                        self.update_settings(ui);
+                        ui.horizontal(|ui| {
+                            ui.label("Language / Langue");
+                            ui.selectable_value(&mut self.prefs.language, "en".into(), "English");
+                            ui.selectable_value(&mut self.prefs.language, "fr".into(), "Français");
+                        });
+                        self.project.settings.language = self.prefs.language.clone();
+                        let _ = self.prefs.save(&preferences_path());
+                    }
+                    ui.heading(self.text("Recent projects", "Projets récents"));
+                    for path in self.prefs.recent.clone() {
+                        ui.horizontal(|ui| {
+                            if ui.small_button("×").clicked() {
+                                self.prefs.remove(&path);
+                                let _ = self.prefs.save(&preferences_path());
+                            }
+                            if ui
+                                .add_enabled(
+                                    path.is_file(),
+                                    egui::Button::new(path.display().to_string()),
+                                )
+                                .clicked()
+                            {
+                                self.load_path(path);
+                            }
+                        });
+                    }
+                });
+            });
+            ctx.request_repaint_after(Duration::from_millis(100));
+            return;
+        }
+        let sidebar = egui::SidePanel::left("navigation")
+            .resizable(true)
+            .default_width(self.prefs.sidebar)
+            .width_range(120.0..=400.0)
             .show(ctx, |ui| {
                 for (section, en, fr) in [
                     (Section::Tracks, "Tracks", "Pistes"),
@@ -534,6 +923,7 @@ impl eframe::App for App {
                     ui.selectable_value(&mut self.section, section, label);
                 }
             });
+        self.prefs.sidebar = sidebar.response.rect.width();
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_enabled_ui(!self.busy && !self.creating, |ui| {
@@ -541,60 +931,7 @@ impl eframe::App for App {
                     let fr = self.project.settings.language == "fr";
                     if self.section == Section::Settings {
                         ui.heading(format!("m4b-Craft {}", env!("CARGO_PKG_VERSION")));
-                        ui.add_enabled(updater::supported(), egui::Checkbox::new(&mut self.updates_enabled, "Enable GitHub update actions (opt-in this session)"));
-                        if !updater::supported() { ui.label("Updates are available on Windows x86_64 only."); }
-                        let previous_channel = self.update_channel;
-                        ui.horizontal(|ui| {
-                            ui.selectable_value(&mut self.update_channel, updater::Channel::Stable, "Stable");
-                            ui.selectable_value(&mut self.update_channel, updater::Channel::Prerelease, "Include prereleases");
-                        });
-                        if previous_channel != self.update_channel || !self.updates_enabled {
-                            self.update_candidate = None;
-                            self.update_download = None;
-                        }
-                        ui.label("Checks/downloads run in the background. Updates lock media actions until complete. Installation requires a saved project and explicit confirmation.");
-                        let idle = updater::guard(self.busy || self.playback.is_busy(), self.dirty, false).is_ok();
-                        ui.add_enabled_ui(self.updates_enabled && idle, |ui| {
-                            if ui.button("Check GitHub Releases").clicked() {
-                                self.update_candidate = None;
-                                self.update_download = None;
-                                let media_busy = self.busy || self.playback.is_busy();
-                                self.status = "Checking signed GitHub Releases…".into();
-                                self.busy = true;
-                                let tx = self.tx.clone();
-                                let channel = self.update_channel;
-                                std::thread::spawn(move || { let _ = tx.send(Message::UpdateChecked(updater::check(channel, media_busy).map_err(|e| format!("Update check: {e:#}")))); });
-                            }
-                            if self.update_candidate.is_some() && ui.button("Download verified update").clicked() {
-                                let update = self.update_candidate.take().unwrap();
-                                let media_busy = self.busy || self.playback.is_busy();
-                                self.status = "Downloading verified update…".into();
-                                self.busy = true;
-                                let tx = self.tx.clone();
-                                std::thread::spawn(move || { let _ = tx.send(Message::UpdateDownloaded(update.download(media_busy).map_err(|e| format!("Update download: {e:#}")))); });
-                            }
-                            let install_clicked = cfg!(target_os = "windows")
-                                && self.update_download.is_some()
-                                && ui.add_enabled(!self.dirty, egui::Button::new("Install update…")).clicked();
-                            if install_clicked
-                                && rfd::MessageDialog::new().set_title("Install verified update")
-                                    .set_description("Launch the normal interactive Windows installer and close m4b-Craft? Your project must already be saved. Reopen m4b-Craft after installation. This package has a cryptographic update signature but no Authenticode publisher certificate.")
-                                    .set_buttons(rfd::MessageButtons::OkCancel).show() == rfd::MessageDialogResult::Ok
-                                && updater::guard(self.busy || self.playback.is_busy(), self.dirty, true).is_ok()
-                            {
-                                let download = self.update_download.take().unwrap();
-                                let media_busy = self.busy || self.playback.is_busy();
-                                let dirty = self.dirty;
-                                self.busy = true;
-                                let tx = self.tx.clone();
-                                std::thread::spawn(move || {
-                                    let result = download.install(media_busy, dirty)
-                                        .map_err(|e| format!("Installer: {e:#}"));
-                                    let _ = tx.send(Message::UpdateInstalled(result));
-                                });
-                            }
-                        });
-                        ui.separator();
+                        self.update_settings(ui);
                         ui.horizontal(|ui| {
                             ui.label("Language / Langue");
                             egui::ComboBox::from_id_salt("language")
@@ -670,6 +1007,8 @@ impl eframe::App for App {
                                     .pick_file()
                                 {
                                     self.project.cover = Some(p);
+                                    self.cover_path = None;
+                                    self.cover_texture = None;
                                 }
                             }
                             if ui
@@ -688,6 +1027,19 @@ impl eframe::App for App {
                                     }),
                             );
                         });
+                        if let Some(texture) = &self.cover_texture {
+                            ui.add(
+                                egui::Image::new(texture)
+                                    .max_size(egui::vec2(280., 280.))
+                                    .maintain_aspect_ratio(true),
+                            );
+                        } else if self.project.cover.is_none() {
+                            ui.label(self.text("No cover", "Sans couverture"));
+                        } else if !self.cover_error.is_empty() {
+                            ui.label(&self.cover_error);
+                        } else {
+                            ui.spinner();
+                        }
                         ui.separator();
                     }
                     if self.section == Section::Tracks {
@@ -731,34 +1083,6 @@ impl eframe::App for App {
                                     self.playback.send(AudioCommand::Volume(self.volume));
                                 }
                             });
-                            if let Some(index) = self.preview_track {
-                                if let Some(track) = self.project.tracks.get(index) {
-                                    let total = track.duration_ms;
-                                    ui.label(
-                                        track
-                                            .path
-                                            .file_name()
-                                            .unwrap_or_default()
-                                            .to_string_lossy(),
-                                    );
-                                    ui.label(format!(
-                                        "{} / {}",
-                                        playback::clock(self.preview.position_ms),
-                                        playback::clock(total)
-                                    ));
-                                    let response = ui.add(
-                                        egui::Slider::new(&mut self.seek_ms, 0..=total)
-                                            .show_value(false),
-                                    );
-                                    if response.drag_stopped()
-                                        || (response.changed() && !response.dragged())
-                                    {
-                                        self.play_preview(index, self.seek_ms);
-                                    } else if !response.dragged() {
-                                        self.seek_ms = self.preview.position_ms.min(total);
-                                    }
-                                }
-                            }
                             ui.label(&self.preview.message);
                         });
                         let mut play_track = None;
@@ -879,6 +1203,16 @@ impl eframe::App for App {
                             self.export();
                         }
                         ui.heading(self.text("AAC export", "Export AAC"));
+                        ui.checkbox(
+                            &mut self.project.settings.lossless_remux,
+                            "Lossless remux for single AAC M4B/M4A / Remux sans perte AAC",
+                        );
+                        if self.project.can_remux() {
+                            ui.label(self.text(
+                                "Audio is copied without re-encoding; bitrate is preserved.",
+                                "Audio copié sans réencodage ; débit conservé.",
+                            ));
+                        }
                         ui.horizontal(|ui| {
                             ui.label(self.text("Bitrate (kb/s)", "Débit (kb/s)"));
                             egui::ComboBox::from_id_salt("bitrate")
@@ -896,12 +1230,17 @@ impl eframe::App for App {
                                 .button(self.text("Check encoder", "Vérifier encodeur"))
                                 .clicked()
                             {
-                                match self.backend.encoders() {
-                                    Ok(e) => {
-                                        self.bitrate_available = Some(e.iter().any(|e| e == "aac"))
-                                    }
-                                    Err(e) => self.log(e.to_string()),
-                                }
+                                self.busy = true;
+                                let backend = self.backend.clone();
+                                let tx = self.tx.clone();
+                                std::thread::spawn(move || {
+                                    let _ = tx.send(Message::Encoders(
+                                        backend
+                                            .encoders()
+                                            .map(|e| e.iter().any(|e| e == "aac"))
+                                            .map_err(|e| e.to_string()),
+                                    ));
+                                });
                             }
                             if let Some(available) = self.bitrate_available {
                                 ui.label(if available {
@@ -917,6 +1256,10 @@ impl eframe::App for App {
                             self.project.estimated_bytes() as f64 / 1048576.
                         ));
                     }
+                    if self.prefs.language != self.project.settings.language {
+                        self.prefs.language = self.project.settings.language.clone();
+                        let _ = self.prefs.save(&preferences_path());
+                    }
                     if before != format!("{:?}", self.project) {
                         self.dirty = true;
                     }
@@ -926,6 +1269,7 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_millis(100));
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let _ = self.prefs.save(&preferences_path());
         self.playback.send(AudioCommand::Exit);
         self.cancel.store(true, Ordering::Relaxed);
         if self.dirty {
@@ -936,13 +1280,89 @@ impl eframe::App for App {
     }
 }
 
+fn project_save_target(path: &std::path::Path) -> PathBuf {
+    path.with_extension("m4bproj")
+}
+fn overwrite_allowed(exists: bool, consent: bool) -> bool {
+    !exists || consent
+}
+
 // A cancelled/failed save must never authorize destructive navigation.
 fn replacement_allowed(choice: rfd::MessageDialogResult, saved: bool) -> bool {
     choice == rfd::MessageDialogResult::No || (choice == rfd::MessageDialogResult::Yes && saved)
 }
+fn load_cover(backend: &DesktopFfmpeg, path: &std::path::Path) -> anyhow::Result<egui::ColorImage> {
+    use anyhow::ensure;
+    let dir = tempfile::tempdir()?;
+    let extracted = dir.path().join("cover.png");
+    let is_image = path
+        .extension()
+        .is_some_and(|e| ["png"].iter().any(|v| e.eq_ignore_ascii_case(v)));
+    let source = if is_image {
+        path
+    } else {
+        backend.extract_cover_preview(path, &extracted)?;
+        &extracted
+    };
+    ensure!(
+        std::fs::metadata(source)?.len() <= 16 * 1024 * 1024,
+        "Cover exceeds 16 MiB"
+    );
+    let mut reader = image::ImageReader::open(source)?.with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader.decode()?;
+    let image = if image.width() > 560 || image.height() > 560 {
+        image.thumbnail(560, 560)
+    } else {
+        image
+    }
+    .to_rgba8();
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        [image.width() as usize, image.height() as usize],
+        image.as_raw(),
+    ))
+}
+
 #[cfg(test)]
 mod project_ui_tests {
     use super::*;
+    #[test]
+    fn normalized_save_target_requires_overwrite_consent() {
+        for input in ["book", "book.json", "book.m4bproj", "book.M4BPROJ"] {
+            assert_eq!(
+                project_save_target(std::path::Path::new(input)),
+                PathBuf::from("book.m4bproj")
+            );
+        }
+        assert!(!overwrite_allowed(true, false));
+        assert!(overwrite_allowed(true, true));
+        assert!(overwrite_allowed(false, false));
+    }
+    #[test]
+    fn welcome_requires_explicit_selection() {
+        let app = App::default();
+        assert!(!app.selected);
+        assert!(app.path.is_none());
+        assert!(!app.startup_checked);
+    }
+    #[test]
+    fn cover_decode_limits_and_absent_state() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("cover.png");
+        let image = image::RgbaImage::from_pixel(80, 40, image::Rgba([255, 0, 0, 255]));
+        image.save(&path).unwrap();
+        let decoded = load_cover(&DesktopFfmpeg::default(), &path).unwrap();
+        assert_eq!(decoded.size, [80, 40]);
+        std::fs::write(&path, b"invalid image").unwrap();
+        assert!(load_cover(&DesktopFfmpeg::default(), &path).is_err());
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(16 * 1024 * 1024 + 1).unwrap();
+        assert!(load_cover(&DesktopFfmpeg::default(), &path).is_err());
+    }
     #[test]
     fn unsaved_navigation_requires_discard_or_successful_save() {
         assert!(replacement_allowed(rfd::MessageDialogResult::No, false));
